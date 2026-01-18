@@ -34,12 +34,13 @@ def save_length_dist(
             lengths.extend(batch_lengths)
             progress.update(task, advance=len(examples))
 
-    # Create a dataframe for plotting
-    df = pd.DataFrame({"length": lengths})
+    # Create a dataframe for plotting, capping at 32k+ bucket
+    capped_lengths = [min(length, 32000) for length in lengths]
+    df = pd.DataFrame({"length": capped_lengths})
 
-    # Create Altair histogram
+    # Create Altair histogram with bins up to 32k, last bucket is 32k+
     chart = alt.Chart(df).mark_bar().encode(
-        alt.X("length:Q", bin=alt.Bin(maxbins=50), title="Token Length"),
+        alt.X("length:Q", bin=alt.Bin(step=2000, extent=[0, 34000]), title="Token Length"),
         alt.Y("count()", title="Frequency"),
     ).properties(
         title="Distribution of Solution Token Lengths",
@@ -63,13 +64,13 @@ if __name__ == "__main__":
                 example["question"] + example["r1_solution_3"]
             ]
         ]
-    #save_length_dist(math["train"].shuffle, batch_fn, "plots/deepmath_length_distribution.pdf", 100_000)
+    save_length_dist(math["train"].shuffle(), batch_fn, "plots/deepmath_length_distribution.pdf", 100_000)
     # CONCLUSION: CAN USE DEEPMATH!
 
     ot = datasets.load_dataset("open-thoughts/OpenThoughts3-1.2M", streaming=True)
     def batch_fn(examples):
         return [x["conversations"][0]["value"] + x["conversations"][1]["value"] for x in examples]
-    #save_length_dist(ot["train"].shuffle(), batch_fn, "plots/ot_length_distribution.pdf", 100_000)
+    save_length_dist(ot["train"].shuffle(), batch_fn, "plots/ot_length_distribution.pdf", 100_000)
     # CONCLUSION: CANT USE OPENTHOUGHTS
 
     nemomath = datasets.load_dataset("nvidia/Nemotron-CC-Math-v1", "4plus", streaming=True)
