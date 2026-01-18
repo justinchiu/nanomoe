@@ -61,9 +61,11 @@ if __name__ == "__main__":
                 example["question"] + example["r1_solution_3"]
             ]
         ]
-    #save_length_dist(math["train"], batch_fn, "plots/deepmath_length_distribution.pdf")
+    save_length_dist(math["train"], batch_fn, "plots/deepmath_length_distribution.pdf")
+    # CONCLUSION: CAN USE!
 
     ot = datasets.load_dataset("open-thoughts/OpenThoughts3-1.2M")
     def batch_fn(examples):
         return [x["conversations"][0]["value"] + x["conversations"][1]["value"] for x in examples]
     save_length_dist(ot["train"].shuffle().select(range(100_000)), batch_fn, "plots/ot_length_distribution.pdf")
+    # CONCLUSION: CANT USE
