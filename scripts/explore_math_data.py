@@ -12,20 +12,22 @@ enc = tiktoken.encoding_for_model("gpt-5")
 
 
 def save_length_dist(
-    dataset: datasets.Dataset,
-    batch_fn: Callable[[datasets.Dataset], list[str]],
+    dataset: datasets.IterableDataset,
+    batch_fn: Callable[[list[dict]], list[str]],
     filepath: str,
+    max_examples: int,
 ):
     batch_size = os.cpu_count()
     lengths = []
+    it = iter(dataset)
     with Progress(
         SpinnerColumn(),
         *Progress.get_default_columns(),
         TimeElapsedColumn(),
     ) as progress:
-        task = progress.add_task("Tokenizing...", total=len(dataset))
-        for start_idx in range(0, len(dataset), batch_size):
-            examples = dataset.select(range(start_idx, min(start_idx+batch_size, len(dataset))))
+        task = progress.add_task("Tokenizing...", total=max_examples)
+        for _ in range(0, max_examples, batch_size):
+            examples = [next(it) for _ in range(batch_size)]
             batch = batch_fn(examples)
             encodings = enc.encode_batch(batch, num_threads=os.cpu_count())
             batch_lengths = [len(x) for x in encodings]
@@ -50,7 +52,7 @@ def save_length_dist(
 
 if __name__ == "__main__":
     os.makedirs("plots", exist_ok=True)
-    math = datasets.load_dataset("zwhe99/DeepMath-103K")
+    math = datasets.load_dataset("zwhe99/DeepMath-103K", streaming=True)
     def batch_fn(examples):
         return [
             x
@@ -61,11 +63,18 @@ if __name__ == "__main__":
                 example["question"] + example["r1_solution_3"]
             ]
         ]
-    save_length_dist(math["train"], batch_fn, "plots/deepmath_length_distribution.pdf")
-    # CONCLUSION: CAN USE!
+    #save_length_dist(math["train"].shuffle, batch_fn, "plots/deepmath_length_distribution.pdf", 100_000)
+    # CONCLUSION: CAN USE DEEPMATH!
 
-    ot = datasets.load_dataset("open-thoughts/OpenThoughts3-1.2M")
+    ot = datasets.load_dataset("open-thoughts/OpenThoughts3-1.2M", streaming=True)
     def batch_fn(examples):
         return [x["conversations"][0]["value"] + x["conversations"][1]["value"] for x in examples]
-    save_length_dist(ot["train"].shuffle().select(range(100_000)), batch_fn, "plots/ot_length_distribution.pdf")
-    # CONCLUSION: CANT USE
+    #save_length_dist(ot["train"].shuffle(), batch_fn, "plots/ot_length_distribution.pdf", 100_000)
+    # CONCLUSION: CANT USE OPENTHOUGHTS
+
+    nemomath = datasets.load_dataset("nvidia/Nemotron-CC-Math-v1", "4plus", streaming=True)
+    def batch_fn(examples):
+        return [example["text"] for example in examples]
+    save_length_dist(nemomath["train"].shuffle(), batch_fn, "plots/nemomath_length_distribution.pdf", 100_000)
+    # CONCLUSION: ?
+
