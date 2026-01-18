@@ -1,4 +1,6 @@
 import os
+from typing import Callable
+
 import datasets
 import tiktoken
 import numpy as np
@@ -11,6 +13,7 @@ enc = tiktoken.encoding_for_model("gpt-5")
 
 def save_length_dist(
     dataset: datasets.Dataset,
+    batch_fn: Callable[[datasets.Dataset], list[str]],
     filepath: str,
 ):
     batch_size = os.cpu_count()
@@ -20,18 +23,10 @@ def save_length_dist(
         *Progress.get_default_columns(),
         TimeElapsedColumn(),
     ) as progress:
-        task = progress.add_task("Tokenizing...", total=len(train))
-        for start_idx in range(0, len(train), batch_size):
-            examples = train.select(range(start_idx, min(start_idx+batch_size, len(train))))
-            batch = [
-                x
-                for example in examples
-                for x in [
-                    example["r1_solution_1"],
-                    example["r1_solution_2"],
-                    example["r1_solution_3"]
-                ]
-            ]
+        task = progress.add_task("Tokenizing...", total=len(dataset))
+        for start_idx in range(0, len(dataset), batch_size):
+            examples = dataset.select(range(start_idx, min(start_idx+batch_size, len(dataset))))
+            batch = batch_fn(examples)
             encodings = enc.encode_batch(batch, num_threads=os.cpu_count())
             batch_lengths = [len(x) for x in encodings]
             lengths.extend(batch_lengths)
@@ -56,8 +51,19 @@ def save_length_dist(
 if __name__ == "__main__":
     os.makedirs("plots", exist_ok=True)
     math = datasets.load_dataset("zwhe99/DeepMath-103K")
-    train = math["train"]
-    #save_length_dist(train, "plots/deepmath_length_distribution.pdf")
+    def batch_fn(examples):
+        return [
+            x
+            for example in examples
+            for x in [
+                example["question"] + example["r1_solution_1"],
+                example["question"] + example["r1_solution_2"],
+                example["question"] + example["r1_solution_3"]
+            ]
+        ]
+    #save_length_dist(math["train"], batch_fn, "plots/deepmath_length_distribution.pdf")
 
     ot = datasets.load_dataset("open-thoughts/OpenThoughts3-1.2M")
-    import ipdb; ipdb.set_trace()
+    def batch_fn(examples):
+        return [x["conversations"][0]["value"] + x["conversations"][1]["value"] for x in examples]
+    save_length_dist(ot["train"].shuffle().select(range(100_000)), batch_fn, "plots/ot_length_distribution.pdf")
