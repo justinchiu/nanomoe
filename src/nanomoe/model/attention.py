@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import MoEConfig
+from nanomoe.model.config import MoEConfig
 
 
 class RoPE(nn.Module):

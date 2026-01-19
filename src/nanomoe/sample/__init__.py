@@ -1,4 +1,4 @@
-from .generate import (
+from nanomoe.sample.generate import (
     SamplingMetrics,
     SamplingState,
     generate,

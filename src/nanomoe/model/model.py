@@ -11,9 +11,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .attention import Attention
-from .config import MoEConfig
-from .moe import DenseFFN, MoELayer
+from nanomoe.model.attention import Attention
+from nanomoe.model.config import MoEConfig
+from nanomoe.model.moe import DenseFFN, MoELayer
 
 
 class RMSNorm(nn.Module):

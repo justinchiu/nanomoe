@@ -12,7 +12,7 @@ from typing import Any
 
 from datasets import IterableDataset
 
-from .types import Sample
+from nanomoe.data.types import Sample
 
 
 @dataclass

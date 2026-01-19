@@ -8,7 +8,7 @@ import math
 
 import torch
 
-from .types import PackedBatch, Sample
+from nanomoe.data.types import PackedBatch, Sample
 
 
 def get_seqlen_balanced_partitions(
