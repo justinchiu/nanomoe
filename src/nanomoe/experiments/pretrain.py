@@ -1,7 +1,7 @@
 """Small-scale pretraining script with sequence packing and document masking.
 
 Usage:
-    uv run python scripts/pretrain.py
+    uv run python -m nanomoe.experiments.pretrain max_steps=2
 
 Features:
 - Streams from HuggingFace datasets
@@ -10,9 +10,9 @@ Features:
 - Supports gradient accumulation, checkpointing, wandb logging
 """
 
-from dataclasses import dataclass
 from typing import Any
 
+import chz
 import datasets
 import torch
 import torch.nn.functional as F
@@ -32,7 +32,7 @@ from nanomoe.train import (
 )
 
 
-@dataclass
+@chz.chz
 class TrainConfig:
     # Model
     model_preset: str = "small"  # "tiny", "small", "medium", "large", or "custom"
@@ -40,9 +40,9 @@ class TrainConfig:
     num_experts_per_tok: int | None = None  # Override if set
 
     # Data
-    dataset_name: str = "HuggingFaceFW/fineweb-edu"
-    dataset_config: str = "sample-10BT"
-    tokenizer_name: str = "Qwen/Qwen2.5-0.5B"
+    dataset_name: str = "nvidia/Nemotron-CC-Math-v1"
+    dataset_config: str = "4plus"
+    tokenizer_name: str = "Qwen/Qwen3-0.6B"
     pack_size: int = 8192
 
     # Training
@@ -123,9 +123,7 @@ def compute_loss(
     return total_loss, metrics
 
 
-def main():
-    cfg = TrainConfig()
-
+def main(cfg: TrainConfig) -> None:
     # Set seed
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
@@ -159,7 +157,7 @@ def main():
 
     # Load tokenizer and update vocab size
     print(f"Loading tokenizer: {cfg.tokenizer_name}")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name, trust_remote_code=True)
     model_config.vocab_size = len(tokenizer)
 
     # Create model
@@ -220,6 +218,7 @@ def main():
         prefetch_batches=4,
         shuffle_buffer=10_000,
         seed=cfg.seed,
+        add_special_tokens=False,
     )
 
     # Resume from checkpoint if exists
@@ -282,4 +281,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    config = chz.entrypoint(TrainConfig)
+    main(config)

@@ -6,9 +6,10 @@ readme = "README.md"
 authors = [
     { email = "chiu.justin.t@gmail.com" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = [
     "altair>=6.0.0",
+    "chz",
     "datasets>=4.5.0",
     "hf-transfer>=0.1.9",
     "ipdb>=0.13.13",

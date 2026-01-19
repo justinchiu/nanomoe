@@ -53,6 +53,7 @@ class PackedPretrainDataset:
         prefetch_batches: int = 4,
         shuffle_buffer: int = 10_000,
         seed: int = 42,
+        add_special_tokens: bool = False,
         tokenize_fn: Callable[[dict, Any], list[int]] | None = None,
     ):
         self.hf_dataset = hf_dataset
@@ -64,6 +65,7 @@ class PackedPretrainDataset:
         self.prefetch_batches = prefetch_batches
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
+        self.add_special_tokens = add_special_tokens
 
         # Custom tokenization function or default
         self._tokenize_fn = tokenize_fn or self._default_tokenize
@@ -79,11 +81,11 @@ class PackedPretrainDataset:
         self._error: Exception | None = None
 
     def _default_tokenize(self, example: dict, tokenizer: Any) -> list[int]:
-        """Default tokenization: encode text with special tokens."""
+        """Default tokenization: encode text, optionally with special tokens."""
         text = example.get(self.text_key, "")
         if not text:
             return []
-        return tokenizer.encode(text, add_special_tokens=True)
+        return tokenizer.encode(text, add_special_tokens=self.add_special_tokens)
 
     def _get_stream_iter(self) -> Iterator:
         """Get a fresh iterator over the dataset."""
