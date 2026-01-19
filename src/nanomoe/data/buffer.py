@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from nanomoe.data.packing import pack_sequences
 from nanomoe.data.types import PackedBatch, Sample
@@ -23,8 +23,17 @@ class SourceSpec(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     name: str
-    source: Iterable[Sample]
+    source: Any
     weight: float = 1.0
+
+    @field_validator("source")
+    @classmethod
+    def _ensure_iterable(cls, value: Any) -> Any:
+        try:
+            iter(value)
+        except TypeError as exc:
+            raise TypeError("source must be iterable") from exc
+        return value
 
 
 class DataBufferConfig(BaseModel):
@@ -50,6 +59,7 @@ class DataBufferStats(BaseModel):
 class _SourceState:
     name: str
     weight: float
+    source: Iterable[Sample]
     iterator: Iterator[Sample]
     exhausted: bool = False
     samples_seen: int = 0
@@ -63,9 +73,16 @@ class DataBuffer:
         self._rng = random.Random(self.config.seed)
         self._stats = DataBufferStats()
 
-        self._sources: list[_SourceState] = [
-            _SourceState(name=s.name, weight=s.weight, iterator=iter(s.source)) for s in sources
-        ]
+        self._sources: list[_SourceState] = []
+        for spec in sources:
+            self._sources.append(
+                _SourceState(
+                    name=spec.name,
+                    weight=spec.weight,
+                    source=spec.source,
+                    iterator=iter(spec.source),
+                )
+            )
 
         self._queue: queue.Queue[PackedBatch | None] | None = None
         self._stop_event = threading.Event()
@@ -192,6 +209,17 @@ class DataBuffer:
     def stats(self) -> DataBufferStats:
         return self._stats
 
+    def _reset_iterators(self) -> None:
+        for source in self._sources:
+            source.iterator = iter(source.source)
+            source.exhausted = False
+            for _ in range(source.samples_seen):
+                try:
+                    next(source.iterator)
+                except StopIteration:
+                    source.exhausted = True
+                    break
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "rng_state": self._rng.getstate(),
@@ -206,6 +234,14 @@ class DataBuffer:
         stats = state.get("stats")
         if stats is not None:
             self._stats = DataBufferStats(**stats)
+        source_state = state.get("sources", {})
+        for source in self._sources:
+            saved = source_state.get(source.name)
+            if saved is None:
+                continue
+            source.samples_seen = int(saved.get("samples_seen", 0))
+            source.exhausted = bool(saved.get("exhausted", False))
+        self._reset_iterators()
 
 
 def create_sft_tokenize_fn(
