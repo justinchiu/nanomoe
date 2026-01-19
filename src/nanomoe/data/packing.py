@@ -101,10 +101,9 @@ def pack_sequences(
     for indices in partitions:
         cu_seqlens = [0]
         flat_tokens = []
-        flat_loss_mask = []
+        flat_token_weights = []
         flat_position_ids = []
         flat_log_probs = []
-        flat_advantages = []
         rewards = []
 
         for i in indices:
@@ -112,24 +111,31 @@ def pack_sequences(
             seq_len = len(sample.tokens)
 
             flat_tokens.extend(sample.tokens)
-            flat_loss_mask.extend(sample.loss_mask)
             flat_position_ids.extend(range(seq_len))
             flat_log_probs.extend(sample.log_probs)
-
-            # Advantage will be filled in during training
-            flat_advantages.extend([0.0] * len(sample.log_probs))
             rewards.append(sample.reward)
+
+            if sample.token_weights:
+                if len(sample.token_weights) != seq_len:
+                    raise ValueError("token_weights length must match tokens length")
+                flat_token_weights.extend(sample.token_weights)
+            else:
+                shifted = [float(x) for x in sample.loss_mask[1:]]
+                shifted.append(0.0)
+                flat_token_weights.extend(shifted)
 
             cu_seqlens.append(cu_seqlens[-1] + seq_len)
 
+        log_probs = torch.tensor(flat_log_probs, dtype=torch.float32) if flat_log_probs else None
+        rewards_t = torch.tensor(rewards, dtype=torch.float32) if rewards else None
+
         packed = PackedBatch(
             tokens=torch.tensor(flat_tokens, dtype=torch.long),
-            loss_mask=torch.tensor(flat_loss_mask, dtype=torch.int),
             position_ids=torch.tensor(flat_position_ids, dtype=torch.int),
             cu_seqlens=torch.tensor(cu_seqlens, dtype=torch.int32),
-            log_probs=torch.tensor(flat_log_probs, dtype=torch.float32),
-            advantages=torch.tensor(flat_advantages, dtype=torch.float32),
-            rewards=torch.tensor(rewards, dtype=torch.float32),
+            token_weights=torch.tensor(flat_token_weights, dtype=torch.float32),
+            log_probs=log_probs,
+            rewards=rewards_t,
         )
         result.append(packed)
 
@@ -151,9 +157,9 @@ def unpack_batch(packed: PackedBatch) -> list[dict]:
         sequences.append(
             {
                 "tokens": packed.tokens[start:end],
-                "loss_mask": packed.loss_mask[start:end],
+                "token_weights": packed.token_weights[start:end],
                 "position_ids": packed.position_ids[start:end],
-                "reward": packed.rewards[i],
+                "reward": packed.rewards[i] if packed.rewards is not None else None,
             }
         )
 

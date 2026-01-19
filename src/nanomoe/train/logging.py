@@ -74,7 +74,7 @@ class WandbLogger(Logger):
         **kwargs,
     ):
         try:
-            import wandb
+            import wandb  # ty: ignore[unresolved-import]
 
             self._wandb = wandb
         except ImportError as err:

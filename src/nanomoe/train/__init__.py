@@ -17,6 +17,7 @@ from nanomoe.train.logging import (
     WandbLogger,
     setup_logging,
 )
+from nanomoe.train.loop import TrainLoopConfig, TrainState, train_loop
 from nanomoe.train.lr_scheduler import ConstantScheduler, CosineScheduler, WSDConfig, WSDScheduler
 
 __all__ = [
@@ -28,6 +29,10 @@ __all__ = [
     "setup_fsdp2",
     "init_distributed",
     "cleanup_distributed",
+    # Loop
+    "TrainLoopConfig",
+    "TrainState",
+    "train_loop",
     # Checkpointing
     "Checkpointer",
     "CheckpointState",

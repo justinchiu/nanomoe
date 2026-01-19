@@ -159,6 +159,10 @@ def top_k_sample(
     return sampled_token, sampled_log_prob
 
 
+def _unwrap_outputs(outputs) -> tuple[Tensor, list[tuple[Tensor, Tensor]] | None]:
+    return outputs.logits, outputs.past_key_values
+
+
 @torch.no_grad()
 def generate(
     model: Module,
@@ -171,10 +175,10 @@ def generate(
     top_p: float = 0.95,
     top_k: int | None = None,
 ) -> SampleOutput:
-    """Generate tokens from a HuggingFace model with log probability tracking.
+    """Generate tokens from a model with logits/past_key_values attributes.
 
     Args:
-        model: HuggingFace causal LM
+        model: Causal LM with `.logits` and `.past_key_values`
         input_ids: (batch, prompt_len) input token ids
         attention_mask: (batch, prompt_len) attention mask, or None
         max_new_tokens: Maximum number of tokens to generate
@@ -222,8 +226,8 @@ def generate(
             past_key_values=past_key_values,
             use_cache=True,
         )
-        past_key_values = outputs.past_key_values
-        logits = outputs.logits[:, -1, :]  # (batch, vocab)
+        logits, past_key_values = _unwrap_outputs(outputs)
+        logits = logits[:, -1, :]  # (batch, vocab)
 
         # Sample
         next_token, log_prob = sample_fn(logits)
@@ -333,7 +337,7 @@ def generate_grpo_samples(
     """Generate multiple samples per prompt for GRPO.
 
     Args:
-        model: HuggingFace causal LM
+        model: Causal LM with `.logits` and `.past_key_values`
         prompts: (num_prompts, prompt_len) prompt token ids
         attention_mask: (num_prompts, prompt_len) attention mask
         n_samples_per_prompt: Number of samples to generate per prompt
@@ -363,7 +367,7 @@ def generate_grpo_samples_with_metrics(
     """Generate multiple samples per prompt for GRPO with timing metrics.
 
     Args:
-        model: HuggingFace causal LM
+        model: Causal LM with `.logits` and `.past_key_values`
         prompts: (num_prompts, prompt_len) prompt token ids
         attention_mask: (num_prompts, prompt_len) attention mask
         n_samples_per_prompt: Number of samples to generate per prompt

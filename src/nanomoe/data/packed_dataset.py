@@ -10,43 +10,12 @@ Handles:
 import queue
 import threading
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import Tensor
 
-
-@dataclass
-class PackedBatch:
-    """A packed batch of documents ready for training.
-
-    All documents are concatenated, with cu_seqlens marking boundaries.
-    Use cu_seqlens to create document-aware attention masks.
-    """
-
-    input_ids: Tensor  # [total_tokens]
-    labels: Tensor  # [total_tokens] - shifted targets
-    position_ids: Tensor  # [total_tokens] - resets per document
-    cu_seqlens: Tensor  # [num_docs + 1] - cumulative sequence lengths
-    loss_mask: Tensor  # [total_tokens] - which tokens to compute loss on
-
-    @property
-    def num_tokens(self) -> int:
-        return self.input_ids.shape[0]
-
-    @property
-    def num_docs(self) -> int:
-        return len(self.cu_seqlens) - 1
-
-    def to(self, device: torch.device) -> "PackedBatch":
-        return PackedBatch(
-            input_ids=self.input_ids.to(device),
-            labels=self.labels.to(device),
-            position_ids=self.position_ids.to(device),
-            cu_seqlens=self.cu_seqlens.to(device),
-            loss_mask=self.loss_mask.to(device),
-        )
+from nanomoe.data.types import PackedBatch
 
 
 class PackedPretrainDataset:
@@ -68,7 +37,7 @@ class PackedPretrainDataset:
         )
 
         for batch in dataset:
-            # batch.input_ids: [pack_size] packed tokens
+            # batch.tokens: [pack_size] packed tokens
             # batch.cu_seqlens: document boundaries
             loss = train_step(model, batch)
     """
@@ -126,7 +95,7 @@ class PackedPretrainDataset:
         all_input_ids = []
         all_labels = []
         all_position_ids = []
-        all_loss_mask = []
+        all_token_weights = []
         cu_seqlens = [0]
 
         for tokens in doc_tokens:
@@ -136,15 +105,15 @@ class PackedPretrainDataset:
             all_labels.extend(tokens[1:] + [tokens[-1]])  # Last label is ignored anyway
             all_position_ids.extend(range(seq_len))
             # Loss on all tokens except first (no previous context)
-            all_loss_mask.extend([0] + [1] * (seq_len - 1))
+            all_token_weights.extend([0.0] + [1.0] * (seq_len - 1))
             cu_seqlens.append(cu_seqlens[-1] + seq_len)
 
         return PackedBatch(
-            input_ids=torch.tensor(all_input_ids, dtype=torch.long),
+            tokens=torch.tensor(all_input_ids, dtype=torch.long),
             labels=torch.tensor(all_labels, dtype=torch.long),
             position_ids=torch.tensor(all_position_ids, dtype=torch.long),
             cu_seqlens=torch.tensor(cu_seqlens, dtype=torch.int32),
-            loss_mask=torch.tensor(all_loss_mask, dtype=torch.bool),
+            token_weights=torch.tensor(all_token_weights, dtype=torch.float32),
         )
 
     def _prefetch_worker(self):

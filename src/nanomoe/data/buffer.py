@@ -80,6 +80,7 @@ class DataBuffer:
         return Sample(
             tokens=tokens,
             loss_mask=loss_mask,
+            token_weights=[0.0] + [1.0] * (len(tokens) - 1),
             prompt_len=0,
         )
 
@@ -184,6 +185,7 @@ class DataBuffer:
                     "tokens": s.tokens,
                     "loss_mask": s.loss_mask,
                     "log_probs": s.log_probs,
+                    "token_weights": s.token_weights,
                     "reward": s.reward,
                     "prompt_len": s.prompt_len,
                     "group_id": s.group_id,
@@ -254,6 +256,7 @@ def create_sft_tokenize_fn(
         return Sample(
             tokens=tokens,
             loss_mask=loss_mask,
+            token_weights=[float(x) for x in loss_mask[1:]] + [0.0],
             prompt_len=prompt_len,
         )
 

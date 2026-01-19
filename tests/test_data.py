@@ -2,7 +2,7 @@
 
 import torch
 
-from nanomoe.data import PackedBatch, Sample, pack_sequences
+from nanomoe.data import PackedBatch, PackedSFTDataset, Sample, SFTDatasetConfig, pack_sequences
 
 
 class TestSample:
@@ -53,7 +53,8 @@ class TestPackSequences:
         batch = batches[0]
         assert isinstance(batch, PackedBatch)
         assert batch.tokens.shape[0] == 3
-        assert batch.loss_mask.shape[0] == 3
+        assert batch.token_weights.shape[0] == 3
+        assert batch.token_weights.tolist() == [1.0, 1.0, 0.0]
         assert batch.position_ids.tolist() == [0, 1, 2]
         assert batch.cu_seqlens.tolist() == [0, 3]
 
@@ -81,7 +82,7 @@ class TestPackSequences:
         # Each batch should have one sample
         assert batches[0].tokens.shape[0] + batches[1].tokens.shape[0] == 5
 
-    def test_pack_advantages_computation(self):
+    def test_pack_token_weights(self):
         # Two samples in same group with different rewards
         # Each sample has 2 tokens but only 1 generated token (1 log_prob)
         samples = [
@@ -91,12 +92,10 @@ class TestPackSequences:
         batches = pack_sequences(samples, num_packs=1)
 
         batch = batches[0]
-        # Advantages are stored per log_prob (per generated token), not per token
-        # Each sample has 1 log_prob, so total = 2
-        assert batch.advantages is not None
-        assert len(batch.advantages) == 2
+        assert batch.token_weights.shape[0] == 4
         # Rewards are per sample
-        assert len(batch.rewards) == 2
+        assert batch.rewards is not None
+        assert batch.rewards.numel() == 2
 
     def test_pack_empty_samples(self):
         samples = []
@@ -112,13 +111,58 @@ class TestPackedBatch:
     def test_packed_batch_to_device(self):
         batch = PackedBatch(
             tokens=torch.tensor([1, 2, 3]),
-            loss_mask=torch.tensor([0, 1, 1]),
             position_ids=torch.tensor([0, 1, 2]),
             cu_seqlens=torch.tensor([0, 3]),
+            token_weights=torch.tensor([1.0, 1.0, 0.0]),
             log_probs=torch.tensor([-1.0, -2.0]),
-            advantages=torch.tensor([0.5, -0.5]),
             rewards=torch.tensor([1.0]),
         )
         # Just verify the batch was created correctly
         assert batch.tokens.shape == (3,)
         assert batch.cu_seqlens.shape == (2,)
+
+
+class DummyTokenizer:
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        parts = []
+        for msg in messages:
+            parts.append(f"{msg['role']} {msg['content']}")
+        if add_generation_prompt:
+            parts.append("assistant")
+        return " ".join(parts)
+
+    def encode(self, text, add_special_tokens=False):
+        return list(range(len(text.split())))
+
+
+class DummyDataset:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def shuffle(self, seed, buffer_size):
+        return self
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class TestPackedSFTDataset:
+    def test_sft_token_weights_shift(self):
+        dataset = DummyDataset(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": "ok done"},
+                    ]
+                }
+            ]
+        )
+        tokenizer = DummyTokenizer()
+        config = SFTDatasetConfig(pack_size=5, max_seq_len=5, min_seq_len=1, input_key="messages", seed=0)
+        sft = PackedSFTDataset(hf_dataset=dataset, tokenizer=tokenizer, config=config)
+
+        batch = next(iter(sft))
+        assert batch.labels is not None
+        assert batch.tokens.shape[0] == 5
+        assert batch.token_weights.tolist() == [0.0, 0.0, 1.0, 1.0, 0.0]

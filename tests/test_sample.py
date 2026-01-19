@@ -1,8 +1,10 @@
 """Tests for nanomoe.sample module."""
 
 import torch
+import torch.nn as nn
 
-from nanomoe.sample import SamplingMetrics, SamplingState, top_k_sample, top_p_sample
+from nanomoe.model import ModelOutput
+from nanomoe.sample import SamplingMetrics, SamplingState, generate, top_k_sample, top_p_sample
 
 
 class TestTopPSample:
@@ -146,3 +148,33 @@ class TestSamplingState:
         assert state.total_tokens == 0
         assert state.total_time == 0.0
         assert len(state.metrics_history) == 0
+
+
+class DummyModel(nn.Module):
+    def __init__(self, vocab_size: int = 5):
+        super().__init__()
+        self.vocab_size = vocab_size
+
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=True):
+        batch, seq_len = input_ids.shape
+        logits = torch.zeros(batch, seq_len, self.vocab_size)
+        logits[..., 1] = 10.0
+        return ModelOutput(logits=logits, aux_loss=0.0, past_key_values=None)
+
+
+class TestGenerate:
+    def test_generate_uses_model_output(self):
+        model = DummyModel()
+        input_ids = torch.tensor([[2, 3]])
+
+        output = generate(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=None,
+            max_new_tokens=2,
+            eos_token_id=0,
+            top_k=1,
+        )
+
+        assert output.tokens.shape == (1, 4)
+        assert output.log_probs.shape == (1, 2)

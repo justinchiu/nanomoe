@@ -10,23 +10,25 @@ Features:
 - Supports gradient accumulation, checkpointing, wandb logging
 """
 
-import time
 from dataclasses import dataclass
 from typing import Any
 
 import datasets
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from transformers import AutoTokenizer
 
-from nanomoe.data import PackedPretrainDataset, PretrainBatch, create_document_mask
+from nanomoe.data import PackedBatch, PackedPretrainDataset, create_document_mask
 from nanomoe.model import MoEConfig, create_model
 from nanomoe.train import (
     Checkpointer,
+    TrainLoopConfig,
+    TrainState,
     WSDConfig,
     WSDScheduler,
     setup_logging,
+    train_loop,
 )
 
 
@@ -71,7 +73,7 @@ class TrainConfig:
 
 def compute_loss(
     model: Any,  # Can be MoETransformer or torch.compile'd version
-    batch: PretrainBatch,
+    batch: PackedBatch,
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, dict]:
@@ -84,7 +86,7 @@ def compute_loss(
 
     # Forward pass
     # Reshape for batch dim
-    input_ids = batch.input_ids.unsqueeze(0)  # [1, seq_len]
+    input_ids = batch.tokens.unsqueeze(0)  # [1, seq_len]
     position_ids = batch.position_ids.unsqueeze(0)  # [1, seq_len]
 
     outputs = model(
@@ -94,17 +96,19 @@ def compute_loss(
         use_cache=False,
     )
 
-    logits = outputs["logits"][0]  # [seq_len, vocab]
-    aux_loss = outputs["aux_loss"]
+    logits = outputs.logits[0]  # [seq_len, vocab]
+    aux_loss = outputs.aux_loss
 
     # Shift for next-token prediction
     shift_logits = logits[:-1]
+    if batch.labels is None:
+        raise ValueError("PackedBatch.labels is required for pretraining")
     shift_labels = batch.labels[:-1]
-    shift_mask = batch.loss_mask[:-1]
+    shift_weights = batch.token_weights[:-1]
 
     # Compute loss only on masked positions
     loss = F.cross_entropy(shift_logits, shift_labels, reduction="none")
-    masked_loss = (loss * shift_mask).sum() / shift_mask.sum().clamp(min=1)
+    masked_loss = (loss * shift_weights).sum() / shift_weights.sum().clamp(min=1)
 
     # Add auxiliary loss
     total_loss = masked_loss + aux_loss
@@ -112,8 +116,8 @@ def compute_loss(
     metrics = {
         "loss": masked_loss.item(),
         "aux_loss": aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss,
-        "num_tokens": shift_mask.sum().item(),
-        "num_docs": batch.num_docs,
+        "num_tokens": shift_weights.sum().item(),
+        "num_docs": len(batch.cu_seqlens) - 1,
     }
 
     return total_loss, metrics
@@ -218,20 +222,11 @@ def main():
         seed=cfg.seed,
     )
 
-    # Training state
-    step = 0
-    tokens_seen = 0
-    accumulated_loss = 0.0
-    accumulated_aux_loss = 0.0
-    accumulated_tokens = 0
-    start_time = time.time()
-
     # Resume from checkpoint if exists
     resume_step, resume_tokens = checkpointer.load(model_for_checkpoint, optimizer, scheduler)
+    state = TrainState(step=resume_step, tokens_seen=resume_tokens)
     if resume_step > 0:
-        step = resume_step
-        tokens_seen = resume_tokens
-        print(f"Resumed from step {step}, tokens_seen {tokens_seen}")
+        print(f"Resumed from step {state.step}, tokens_seen {state.tokens_seen}")
 
     # Gradient scaler for mixed precision
     scaler = GradScaler() if cfg.dtype == "float16" else None
@@ -239,115 +234,51 @@ def main():
     print(f"Starting training for {cfg.max_steps} steps...")
     print(f"Pack size: {cfg.pack_size}, batch size: {cfg.batch_size}, grad accum: {cfg.gradient_accumulation}")
 
+    loop_cfg = TrainLoopConfig(
+        max_steps=cfg.max_steps,
+        max_tokens=cfg.max_tokens,
+        gradient_accumulation=cfg.gradient_accumulation,
+        log_every=cfg.log_every,
+        checkpoint_every=cfg.checkpoint_every,
+        max_grad_norm=cfg.max_grad_norm,
+    )
+
+    def data_iter_factory():
+        return iter(dataset)
+
     try:
-        batch_iter = iter(dataset)
-        micro_batches = []
+        data_iter = data_iter_factory()
 
-        while step < cfg.max_steps:
-            if cfg.max_tokens and tokens_seen >= cfg.max_tokens:
-                print(f"Reached max_tokens {cfg.max_tokens}")
-                break
-
-            # Collect micro batches for gradient accumulation
-            while len(micro_batches) < cfg.gradient_accumulation:
-                try:
-                    batch = next(batch_iter)
-                    micro_batches.append(batch)
-                except StopIteration:
-                    # Restart iterator
-                    batch_iter = iter(dataset)
-
-            # Gradient accumulation
-            optimizer.zero_grad()
-            step_loss = 0.0
-            step_aux_loss = 0.0
-            step_tokens = 0
-
-            for batch in micro_batches[: cfg.gradient_accumulation]:
-                # Forward + backward
-                if scaler:
-                    with autocast(dtype=torch.float16):
-                        loss, metrics = compute_loss(model, batch, device, dtype)
-                    scaler.scale(loss / cfg.gradient_accumulation).backward()
-                else:
-                    with torch.autocast(device_type="cuda", dtype=dtype, enabled=dtype != torch.float32):
-                        loss, metrics = compute_loss(model, batch, device, dtype)
-                    (loss / cfg.gradient_accumulation).backward()
-
-                step_loss += metrics["loss"]
-                step_aux_loss += metrics["aux_loss"]
-                step_tokens += metrics["num_tokens"]
-
-            micro_batches = micro_batches[cfg.gradient_accumulation :]
-
-            # Gradient clipping and optimizer step
-            if scaler:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-
-            # Update LR
-            tokens_seen += step_tokens
-            lr = scheduler.step(step=step, tokens_seen=tokens_seen)
-
-            step += 1
-            accumulated_loss += step_loss / cfg.gradient_accumulation
-            accumulated_aux_loss += step_aux_loss / cfg.gradient_accumulation
-            accumulated_tokens += step_tokens
-
-            # Logging
-            if step % cfg.log_every == 0:
-                elapsed = time.time() - start_time
-                tokens_per_sec = accumulated_tokens / elapsed if elapsed > 0 else 0
-
-                log_metrics = {
-                    "train/loss": accumulated_loss / cfg.log_every,
-                    "train/aux_loss": accumulated_aux_loss / cfg.log_every,
-                    "train/lr": lr,
-                    "train/tokens_seen": tokens_seen,
-                    "train/step": step,
-                    "perf/tokens_per_sec": tokens_per_sec,
-                    "perf/elapsed_time": elapsed,
-                }
-                logger.log_metrics(log_metrics, step=step)
-
-                accumulated_loss = 0.0
-                accumulated_aux_loss = 0.0
-                accumulated_tokens = 0
-                start_time = time.time()
-
-            # Checkpointing
-            if step % cfg.checkpoint_every == 0:
-                checkpointer.save(
-                    step=step,
-                    model=model_for_checkpoint,
-                    optimizer=optimizer,
-                    tokens_seen=tokens_seen,
-                    scheduler=scheduler,
-                )
-                print(f"Saved checkpoint at step {step}")
-
+        state = train_loop(
+            model=model,
+            data_iter=data_iter,
+            data_iter_factory=data_iter_factory,
+            step_fn=lambda b: compute_loss(model, b, device, dtype),
+            optimizer=optimizer,
+            scheduler=scheduler,
+            logger=logger,
+            checkpointer=checkpointer,
+            cfg=loop_cfg,
+            state=state,
+            grad_scaler=scaler,
+            autocast_dtype=None if cfg.dtype == "float32" else dtype,
+        )
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
     finally:
         dataset.stop()
 
-    # Final checkpoint
     checkpointer.save(
-        step=step,
+        step=state.step,
         model=model_for_checkpoint,
         optimizer=optimizer,
-        tokens_seen=tokens_seen,
+        tokens_seen=state.tokens_seen,
         scheduler=scheduler,
     )
     checkpointer.wait()
 
     logger.close()
-    print(f"Training complete. Final step: {step}, tokens_seen: {tokens_seen}")
+    print(f"Training complete. Final step: {state.step}, tokens_seen: {state.tokens_seen}")
 
 
 if __name__ == "__main__":

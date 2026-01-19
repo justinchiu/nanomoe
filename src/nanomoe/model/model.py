@@ -14,6 +14,7 @@ from torch import Tensor
 from nanomoe.model.attention import Attention
 from nanomoe.model.config import MoEConfig
 from nanomoe.model.moe import DenseFFN, MoELayer
+from nanomoe.model.output import ModelOutput
 
 
 class RMSNorm(nn.Module):
@@ -141,7 +142,7 @@ class MoETransformer(nn.Module):
         past_key_values: list[tuple[Tensor, Tensor]] | None = None,
         use_cache: bool = False,
         return_dict: bool = True,
-    ) -> dict:
+    ) -> ModelOutput:
         """Forward pass.
 
         Args:
@@ -153,10 +154,7 @@ class MoETransformer(nn.Module):
             return_dict: Always True (for compatibility)
 
         Returns:
-            Dictionary with:
-                logits: [batch, seq_len, vocab_size]
-                aux_loss: Total MoE auxiliary loss
-                past_key_values: KV cache if use_cache=True
+            ModelOutput with logits, aux_loss, and optional KV cache.
         """
         batch_size, seq_len = input_ids.shape
 
@@ -195,12 +193,12 @@ class MoETransformer(nn.Module):
         else:
             logits = hidden_states @ self.embed_tokens.weight.T
 
-        return {
-            "logits": logits,
-            "aux_loss": total_aux_loss,
-            "past_key_values": new_key_values if use_cache else None,
-            "hidden_states": hidden_states,
-        }
+        return ModelOutput(
+            logits=logits,
+            aux_loss=total_aux_loss,
+            past_key_values=new_key_values if use_cache else None,
+            hidden_states=hidden_states,
+        )
 
     @torch.no_grad()
     def generate(
@@ -248,8 +246,8 @@ class MoETransformer(nn.Module):
                 curr_input, position_ids=position_ids, past_key_values=past_key_values, use_cache=True
             )
 
-            logits = outputs["logits"][:, -1, :]  # [batch, vocab]
-            past_key_values = outputs["past_key_values"]
+            logits = outputs.logits[:, -1, :]  # [batch, vocab]
+            past_key_values = outputs.past_key_values
 
             # Sample
             if temperature > 0:

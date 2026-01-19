@@ -60,7 +60,7 @@ def compute_grpo_advantages(
         advantage_clip: Optional advantage clipping
 
     Returns:
-        Samples with log_probs replaced by per-token advantages
+        Samples with token_weights set to per-token advantages (prompt tokens = 0)
     """
     # Group samples by prompt
     num_groups = len(samples) // n_samples_per_prompt
@@ -89,9 +89,9 @@ def compute_grpo_advantages(
         # Assign per-token advantages (same advantage for all tokens in response)
         for i, sample in enumerate(group_samples):
             adv = advantages[i].item()
-            # Replace log_probs with advantages (same shape: one per response token)
-            num_response_tokens = sum(sample.loss_mask)
-            sample.log_probs = [adv] * num_response_tokens
+            token_weights = [adv if m else 0.0 for m in sample.loss_mask[1:]]
+            token_weights.append(0.0)
+            sample.token_weights = token_weights
 
     return samples
 
@@ -111,7 +111,7 @@ def grpo_loss(
 
     Args:
         model: Policy model
-        packed_batch: Packed batch with tokens, masks, advantages
+    packed_batch: Packed batch with tokens and token_weights
         rollout_log_probs: Log probs from rollout (for importance sampling)
 
     Returns:
@@ -122,9 +122,8 @@ def grpo_loss(
 
     # Move batch to device
     tokens = packed_batch.tokens.to(device)
-    loss_mask = packed_batch.loss_mask.to(device)
+    token_weights = packed_batch.token_weights.to(device)
     position_ids = packed_batch.position_ids.to(device)
-    advantages = packed_batch.advantages.to(device)
     # cu_seqlens available in packed_batch for Flash Attention (future use)
 
     # Forward pass
@@ -140,31 +139,22 @@ def grpo_loss(
     log_probs = torch.log_softmax(logits[:-1], dim=-1)  # (seq_len-1, vocab)
     token_log_probs = log_probs.gather(-1, tokens[1:].unsqueeze(-1)).squeeze(-1)  # (seq_len-1,)
 
-    # Mask to response tokens only
-    response_mask = loss_mask[1:].float()  # (seq_len-1,)
-    masked_log_probs = token_log_probs * response_mask
-
-    # Get advantages for response tokens
-    # advantages tensor has one value per response token (matching loss_mask==1)
-    # We need to expand it to match the full sequence
-    response_indices = response_mask.nonzero(as_tuple=True)[0]
-    expanded_advantages = torch.zeros_like(masked_log_probs)
-    if len(response_indices) > 0 and len(advantages) > 0:
-        # Truncate if needed (in case of mismatch)
-        n = min(len(response_indices), len(advantages))
-        expanded_advantages[response_indices[:n]] = advantages[:n]
+    weights = token_weights[1:].float()
+    response_mask = weights.ne(0)
+    masked_log_probs = token_log_probs * weights
+    denom = response_mask.sum().clamp(min=1)
 
     # Policy gradient loss: -E[advantage * log_prob]
-    loss = -(expanded_advantages * masked_log_probs).sum() / (response_mask.sum() + 1e-8)
+    loss = -masked_log_probs.sum() / denom
 
     # Compute metrics
     with torch.no_grad():
         metrics = {
             "loss": loss.item(),
-            "mean_log_prob": (masked_log_probs.sum() / (response_mask.sum() + 1e-8)).item(),
-            "mean_advantage": advantages.mean().item() if len(advantages) > 0 else 0.0,
-            "num_tokens": response_mask.sum().item(),
-            "mean_reward": packed_batch.rewards.mean().item(),
+            "mean_log_prob": token_log_probs[response_mask].mean().item() if response_mask.any() else 0.0,
+            "mean_advantage": weights[response_mask].mean().item() if response_mask.any() else 0.0,
+            "num_tokens": denom.item(),
+            "mean_reward": packed_batch.rewards.mean().item() if packed_batch.rewards is not None else 0.0,
         }
 
     return loss, metrics
