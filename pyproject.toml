@@ -54,3 +54,9 @@ indent-style = "space"
 
 [tool.ty.environment]
 python-version = "3.13"
+
+[tool.ty.rules]
+# torch.distributed functions are conditionally available at runtime
+# wandb is an optional dependency with try/except import
+possibly-missing-attribute = "ignore"
+unresolved-import = "warn"
