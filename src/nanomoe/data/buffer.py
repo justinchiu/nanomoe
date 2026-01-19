@@ -1,206 +1,211 @@
-"""Data buffer for streaming datasets and rollout samples.
+"""Batch mixer that pulls from multiple sample sources and emits PackedBatch."""
 
-Supports:
-- HuggingFace datasets streaming for pretraining/SFT
-- Rollout sample buffer for GRPO
-- Hybrid mode combining both
-"""
+from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
-from typing import Any
+import queue
+import random
+import threading
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
+from typing import Any, Protocol
 
-from datasets import IterableDataset
+from pydantic import BaseModel, ConfigDict
 
-from nanomoe.data.types import Sample
+from nanomoe.data.packing import pack_sequences
+from nanomoe.data.types import PackedBatch, Sample
+
+
+class SampleSource(Protocol):
+    def __iter__(self) -> Iterator[Sample]: ...
+
+
+class SourceSpec(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    name: str
+    source: Iterable[Sample]
+    weight: float = 1.0
+
+
+class DataBufferConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    pack_size: int = 4096
+    max_tokens_per_batch: int | None = None
+    prefetch_batches: int = 0
+    seed: int = 42
+    max_attempts: int = 10_000
+    skip_zero_weight: bool = True
+
+
+class DataBufferStats(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    samples_seen: int = 0
+    skipped_zero_weight: int = 0
+    batches_emitted: int = 0
 
 
 @dataclass
-class BufferState:
-    """Serializable state for checkpointing."""
-
-    epoch: int = 0
+class _SourceState:
+    name: str
+    weight: float
+    iterator: Iterator[Sample]
+    exhausted: bool = False
     samples_seen: int = 0
-    buffer_samples: list[dict] = field(default_factory=list)
 
 
 class DataBuffer:
-    """Unified buffer for pretraining, SFT, and GRPO data loading.
+    """Mix multiple Sample sources and yield packed batches."""
 
-    Three modes:
-    - "streaming": Pull from HuggingFace streaming dataset (pretraining/SFT)
-    - "rollout": Push rollout samples from generation (GRPO)
-    - "hybrid": Combine streaming prompts with rollout samples
-    """
+    def __init__(self, sources: list[SourceSpec], config: DataBufferConfig | None = None):
+        self.config = config or DataBufferConfig()
+        self._rng = random.Random(self.config.seed)
+        self._stats = DataBufferStats()
 
-    def __init__(
-        self,
-        tokenizer: Any | None = None,
-        streaming_dataset: IterableDataset | None = None,
-        tokenize_fn: Callable[[dict], Sample] | None = None,
-        max_seq_len: int = 2048,
-        buffer_size: int = 10_000,
-        shuffle_buffer: int = 1_000,
-        seed: int = 42,
-    ):
-        self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
-        self.buffer_size = buffer_size
-        self.shuffle_buffer = shuffle_buffer
-        self.seed = seed
+        self._sources: list[_SourceState] = [
+            _SourceState(name=s.name, weight=s.weight, iterator=iter(s.source)) for s in sources
+        ]
 
-        # Streaming iterator
-        self._streaming_dataset = streaming_dataset
-        self._streaming_iter: Iterator | None = None
-        self._tokenize_fn = tokenize_fn or self._default_tokenize
+        self._queue: queue.Queue[PackedBatch | None] | None = None
+        self._stop_event = threading.Event()
+        self._prefetch_thread: threading.Thread | None = None
 
-        # Rollout buffer
-        self._rollout_buffer: list[Sample] = []
+    def _sample_weight_sum(self, sample: Sample) -> float:
+        if sample.token_weights:
+            return float(sum(sample.token_weights))
+        if sample.loss_mask:
+            return float(sum(sample.loss_mask[1:]))
+        return 0.0
 
-        # State tracking
-        self._epoch = 0
-        self._samples_seen = 0
-
-    def _default_tokenize(self, example: dict) -> Sample | None:
-        """Default tokenization for text data."""
-        if self.tokenizer is None:
-            raise ValueError("tokenizer required for default tokenization")
-
-        text = example.get("text", "")
-        if not text:
+    def _pick_source(self) -> _SourceState | None:
+        active = [s for s in self._sources if not s.exhausted]
+        if not active:
             return None
+        total = sum(s.weight for s in active)
+        r = self._rng.random() * total
+        acc = 0.0
+        for s in active:
+            acc += s.weight
+            if r <= acc:
+                return s
+        return active[-1]
 
-        tokens = self.tokenizer.encode(text, add_special_tokens=True)
-        if len(tokens) > self.max_seq_len:
-            tokens = tokens[: self.max_seq_len]
-
-        # For pretraining: all tokens are loss tokens
-        loss_mask = [1] * len(tokens)
-
-        return Sample(
-            tokens=tokens,
-            loss_mask=loss_mask,
-            token_weights=[0.0] + [1.0] * (len(tokens) - 1),
-            prompt_len=0,
-        )
-
-    def _get_streaming_iter(self) -> Iterator:
-        """Get or create streaming iterator."""
-        if self._streaming_iter is None:
-            if self._streaming_dataset is None:
-                raise ValueError("No streaming dataset configured")
-            ds = self._streaming_dataset.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer)
-            self._streaming_iter = iter(ds)
-        return self._streaming_iter
-
-    def _fill_from_stream(self, n: int) -> list[Sample]:
-        """Pull n samples from the streaming dataset."""
-        samples = []
-        it = self._get_streaming_iter()
-
-        while len(samples) < n:
+    def _next_sample(self) -> Sample | None:
+        while True:
+            source = self._pick_source()
+            if source is None:
+                return None
             try:
-                raw = next(it)
-                sample = self._tokenize_fn(raw)
-                if sample is not None:
-                    samples.append(sample)
-                    self._samples_seen += 1
+                sample = next(source.iterator)
+                source.samples_seen += 1
+                self._stats.samples_seen += 1
+                return sample
             except StopIteration:
-                # Epoch finished, reset iterator
-                self._epoch += 1
-                self._streaming_iter = None
-                it = self._get_streaming_iter()
+                source.exhausted = True
 
-        return samples
+    def _iter_batches(self) -> Iterator[PackedBatch]:
+        buffer: list[Sample] = []
+        buffer_tokens = 0
+        attempts = 0
+        pack_limit = self.config.max_tokens_per_batch or self.config.pack_size
 
-    # -------------------------------------------------------------------------
-    # Rollout buffer operations (for GRPO)
-    # -------------------------------------------------------------------------
+        while True:
+            sample = self._next_sample()
+            if sample is None:
+                if buffer:
+                    for packed in pack_sequences(buffer, max_tokens_per_batch=pack_limit):
+                        self._stats.batches_emitted += 1
+                        yield packed
+                return
 
-    def add_rollout_samples(self, samples: list[Sample]):
-        """Add samples from rollout generation to the buffer."""
-        self._rollout_buffer.extend(samples)
+            attempts += 1
+            if self.config.skip_zero_weight and self._sample_weight_sum(sample) <= 0:
+                self._stats.skipped_zero_weight += 1
+                if attempts >= self.config.max_attempts:
+                    raise RuntimeError("Too many skipped samples (zero weight).")
+                continue
 
-        # Trim if over capacity
-        if len(self._rollout_buffer) > self.buffer_size:
-            self._rollout_buffer = self._rollout_buffer[-self.buffer_size :]
+            buffer.append(sample)
+            buffer_tokens += len(sample.tokens)
 
-    def get_rollout_samples(self, n: int) -> list[Sample]:
-        """Get and remove n samples from the rollout buffer."""
-        samples = self._rollout_buffer[:n]
-        self._rollout_buffer = self._rollout_buffer[n:]
-        return samples
+            if buffer_tokens >= pack_limit:
+                for packed in pack_sequences(buffer, max_tokens_per_batch=pack_limit):
+                    self._stats.batches_emitted += 1
+                    yield packed
+                buffer = []
+                buffer_tokens = 0
+                attempts = 0
+
+    def _prefetch_worker(self):
+        try:
+            for batch in self._iter_batches():
+                if self._stop_event.is_set():
+                    break
+                assert self._queue is not None
+                self._queue.put(batch)
+        finally:
+            if self._queue is not None:
+                self._queue.put(None)
+
+    def start(self):
+        if self.config.prefetch_batches <= 0:
+            return
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._queue = queue.Queue(maxsize=self.config.prefetch_batches)
+        self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self._prefetch_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join(timeout=5.0)
+            self._prefetch_thread = None
+        if self._queue is not None:
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._queue = None
+
+    def __iter__(self) -> Iterator[PackedBatch]:
+        if self.config.prefetch_batches <= 0:
+            yield from self._iter_batches()
+            return
+
+        self.start()
+        assert self._queue is not None
+
+        try:
+            while True:
+                batch = self._queue.get()
+                if batch is None:
+                    break
+                yield batch
+        finally:
+            self.stop()
 
     @property
-    def rollout_buffer_size(self) -> int:
-        """Current size of the rollout buffer."""
-        return len(self._rollout_buffer)
+    def stats(self) -> DataBufferStats:
+        return self._stats
 
-    # -------------------------------------------------------------------------
-    # Unified interface
-    # -------------------------------------------------------------------------
-
-    def get_batch(
-        self,
-        batch_size: int,
-        mode: str = "streaming",
-    ) -> list[Sample]:
-        """Get a batch of samples.
-
-        Args:
-            batch_size: Number of samples to return
-            mode: "streaming" | "rollout" | "hybrid"
-
-        Returns:
-            List of Sample objects
-        """
-        if mode == "streaming":
-            return self._fill_from_stream(batch_size)
-
-        elif mode == "rollout":
-            return self.get_rollout_samples(batch_size)
-
-        elif mode == "hybrid":
-            # First try rollout buffer, then fill from stream
-            samples = self.get_rollout_samples(batch_size)
-            remaining = batch_size - len(samples)
-            if remaining > 0:
-                samples.extend(self._fill_from_stream(remaining))
-            return samples
-
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
-    # -------------------------------------------------------------------------
-    # Checkpointing
-    # -------------------------------------------------------------------------
-
-    def state_dict(self) -> dict:
-        """Get state for checkpointing."""
+    def state_dict(self) -> dict[str, Any]:
         return {
-            "epoch": self._epoch,
-            "samples_seen": self._samples_seen,
-            "rollout_buffer": [
-                {
-                    "tokens": s.tokens,
-                    "loss_mask": s.loss_mask,
-                    "log_probs": s.log_probs,
-                    "token_weights": s.token_weights,
-                    "reward": s.reward,
-                    "prompt_len": s.prompt_len,
-                    "group_id": s.group_id,
-                }
-                for s in self._rollout_buffer
-            ],
+            "rng_state": self._rng.getstate(),
+            "stats": self._stats.model_dump(),
+            "sources": {s.name: {"samples_seen": s.samples_seen, "exhausted": s.exhausted} for s in self._sources},
         }
 
-    def load_state_dict(self, state: dict):
-        """Restore state from checkpoint."""
-        self._epoch = state["epoch"]
-        self._samples_seen = state["samples_seen"]
-        self._streaming_iter = None  # Will be recreated with correct epoch
-
-        self._rollout_buffer = [Sample(**s) for s in state.get("rollout_buffer", [])]
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        rng_state = state.get("rng_state")
+        if rng_state is not None:
+            self._rng.setstate(rng_state)
+        stats = state.get("stats")
+        if stats is not None:
+            self._stats = DataBufferStats(**stats)
 
 
 def create_sft_tokenize_fn(
