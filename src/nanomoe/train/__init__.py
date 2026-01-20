@@ -18,6 +18,7 @@ from nanomoe.train.logging import (
     setup_logging,
 )
 from nanomoe.train.loop import TrainLoopConfig, TrainState, train_loop
+from nanomoe.train.loss import unified_loss
 from nanomoe.train.lr_scheduler import ConstantScheduler, CosineScheduler, WSDConfig, WSDScheduler
 
 __all__ = [
@@ -29,6 +30,8 @@ __all__ = [
     "setup_fsdp2",
     "init_distributed",
     "cleanup_distributed",
+    # Loss
+    "unified_loss",
     # Loop
     "TrainLoopConfig",
     "TrainState",

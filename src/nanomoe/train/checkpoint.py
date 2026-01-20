@@ -119,6 +119,39 @@ def _materialize_to_cpu(state: dict[str, Any]) -> dict[str, Any]:
     return _copy(state)
 
 
+def _coerce_rng_state(state: Any) -> torch.Tensor | None:
+    """Best-effort conversion for legacy or serialized RNG states."""
+    if state is None:
+        return None
+    if isinstance(state, torch.Tensor):
+        return state.to(dtype=torch.uint8, device="cpu")
+    if isinstance(state, bytes | bytearray):
+        return torch.tensor(list(state), dtype=torch.uint8)
+    if isinstance(state, list | tuple):
+        try:
+            return torch.tensor(state, dtype=torch.uint8)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _coerce_cuda_rng_state(state: Any) -> list[torch.Tensor] | None:
+    if state is None:
+        return None
+    if isinstance(state, torch.Tensor):
+        tensor = _coerce_rng_state(state)
+        return [tensor] if tensor is not None else None
+    if isinstance(state, list | tuple):
+        out: list[torch.Tensor] = []
+        for item in state:
+            tensor = _coerce_rng_state(item)
+            if tensor is None:
+                return None
+            out.append(tensor)
+        return out
+    return None
+
+
 class _AsyncSaver(threading.Thread):
     """Background thread for async checkpoint saving."""
 
@@ -355,9 +388,12 @@ class Checkpointer:
 
         # Restore RNG state
         if "rng" in state:
-            torch.set_rng_state(state["rng"]["torch"])
-            if state["rng"]["cuda"] is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(state["rng"]["cuda"])
+            torch_state = _coerce_rng_state(state["rng"].get("torch"))
+            if torch_state is not None:
+                torch.set_rng_state(torch_state)
+            cuda_state = _coerce_cuda_rng_state(state["rng"].get("cuda"))
+            if cuda_state is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(cuda_state)
 
         return state.get("step", 0), state.get("tokens_seen", 0)
 

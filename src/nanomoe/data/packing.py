@@ -101,6 +101,7 @@ def pack_sequences(
     for indices in partitions:
         cu_seqlens = [0]
         flat_tokens = []
+        flat_labels = []
         flat_token_weights = []
         flat_position_ids = []
         flat_log_probs = []
@@ -111,6 +112,8 @@ def pack_sequences(
             seq_len = len(sample.tokens)
 
             flat_tokens.extend(sample.tokens)
+            if seq_len > 0:
+                flat_labels.extend(sample.tokens[1:] + [sample.tokens[-1]])
             flat_position_ids.extend(range(seq_len))
             flat_log_probs.extend(sample.log_probs)
             rewards.append(sample.reward)
@@ -131,6 +134,7 @@ def pack_sequences(
 
         packed = PackedBatch(
             tokens=torch.tensor(flat_tokens, dtype=torch.long),
+            labels=torch.tensor(flat_labels, dtype=torch.long) if flat_labels else None,
             position_ids=torch.tensor(flat_position_ids, dtype=torch.int),
             cu_seqlens=torch.tensor(cu_seqlens, dtype=torch.int32),
             token_weights=torch.tensor(flat_token_weights, dtype=torch.float32),
@@ -157,6 +161,7 @@ def unpack_batch(packed: PackedBatch) -> list[dict]:
         sequences.append(
             {
                 "tokens": packed.tokens[start:end],
+                "labels": packed.labels[start:end] if packed.labels is not None else None,
                 "token_weights": packed.token_weights[start:end],
                 "position_ids": packed.position_ids[start:end],
                 "reward": packed.rewards[i] if packed.rewards is not None else None,

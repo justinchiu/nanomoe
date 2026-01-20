@@ -7,6 +7,7 @@ from nanomoe.data.buffer import (
 )
 from nanomoe.data.packed_dataset import PackedPretrainDataset, create_document_mask
 from nanomoe.data.packing import get_seqlen_balanced_partitions, pack_sequences, unpack_batch
+from nanomoe.data.rl_dataset import RLDataset, RLDatasetConfig, RLDatasetStats, Sampler, ScoredGroup
 from nanomoe.data.sft_dataset import PackedSFTDataset, SFTDatasetConfig
 from nanomoe.data.types import PackedBatch, Sample, SampleOutput
 
@@ -22,6 +23,12 @@ __all__ = [
     "PackedSFTDataset",
     "SFTDatasetConfig",
     "create_document_mask",
+    # RL dataset
+    "RLDataset",
+    "RLDatasetConfig",
+    "RLDatasetStats",
+    "Sampler",
+    "ScoredGroup",
     # Packing utilities
     "pack_sequences",
     "unpack_batch",

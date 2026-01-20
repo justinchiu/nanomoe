@@ -90,7 +90,7 @@ class DataBuffer:
 
     def _sample_weight_sum(self, sample: Sample) -> float:
         if sample.token_weights:
-            return float(sum(sample.token_weights))
+            return float(sum(abs(w) for w in sample.token_weights))
         if sample.loss_mask:
             return float(sum(sample.loss_mask[1:]))
         return 0.0

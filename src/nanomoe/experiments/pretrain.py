@@ -1,7 +1,7 @@
 """Small-scale pretraining script with sequence packing and document masking.
 
 Usage:
-    uv run python -m nanomoe.experiments.pretrain max_steps=2
+    uv run python -m nanomoe.experiments.pretrain --max_steps=2
 
 Features:
 - Streams from HuggingFace datasets
@@ -15,7 +15,6 @@ from typing import Any
 import chz
 import datasets
 import torch
-import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
 from transformers import AutoTokenizer
 
@@ -29,6 +28,7 @@ from nanomoe.train import (
     WSDScheduler,
     setup_logging,
     train_loop,
+    unified_loss,
 )
 
 
@@ -44,6 +44,13 @@ class TrainConfig:
     dataset_config: str = "4plus"
     tokenizer_name: str = "Qwen/Qwen3-0.6B"
     pack_size: int = 8192
+    max_seq_len: int | None = None
+    text_key: str = "text"
+    min_doc_len: int = 64
+    prefetch_batches: int = 4
+    shuffle_buffer: int = 10_000
+    add_special_tokens: bool = False
+    max_examples: int | None = None  # Limit streaming dataset (useful for overfit)
 
     # Training
     batch_size: int = 1  # Micro batch size (packed sequences)
@@ -62,7 +69,7 @@ class TrainConfig:
     log_every: int = 10
     checkpoint_every: int = 500
     checkpoint_dir: str = "checkpoints/pretrain"
-    wandb_project: str | None = None
+    wandb_project: str | None = "nanomoe"
     wandb_name: str | None = None
 
     # System
@@ -100,23 +107,18 @@ def compute_loss(
     aux_loss = outputs.aux_loss
 
     # Shift for next-token prediction
-    shift_logits = logits[:-1]
     if batch.labels is None:
         raise ValueError("PackedBatch.labels is required for pretraining")
-    shift_labels = batch.labels[:-1]
-    shift_weights = batch.token_weights[:-1]
-
-    # Compute loss only on masked positions
-    loss = F.cross_entropy(shift_logits, shift_labels, reduction="none")
-    masked_loss = (loss * shift_weights).sum() / shift_weights.sum().clamp(min=1)
+    token_loss = unified_loss(logits, batch.labels, batch.token_weights)
 
     # Add auxiliary loss
-    total_loss = masked_loss + aux_loss
+    total_loss = token_loss + aux_loss
 
+    num_tokens = batch.token_weights[:-1].abs().sum().item()
     metrics = {
-        "loss": masked_loss.item(),
+        "loss": token_loss.item(),
         "aux_loss": aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss,
-        "num_tokens": shift_weights.sum().item(),
+        "num_tokens": num_tokens,
         "num_docs": len(batch.cu_seqlens) - 1,
     }
 
@@ -209,16 +211,24 @@ def main(cfg: TrainConfig) -> None:
     # Load dataset
     print(f"Loading dataset: {cfg.dataset_name}/{cfg.dataset_config}")
     hf_dataset = datasets.load_dataset(cfg.dataset_name, cfg.dataset_config, streaming=True, split="train")
+    if cfg.max_examples is not None:
+        if hasattr(hf_dataset, "take"):
+            hf_dataset = hf_dataset.take(cfg.max_examples)
+        else:
+            raise ValueError("Dataset does not support take(); remove max_examples or use a supported dataset")
 
     # Create packed dataset with prefetching
     dataset = PackedPretrainDataset(
         hf_dataset=hf_dataset,
         tokenizer=tokenizer,
         pack_size=cfg.pack_size,
-        prefetch_batches=4,
-        shuffle_buffer=10_000,
+        max_seq_len=cfg.max_seq_len,
+        text_key=cfg.text_key,
+        min_doc_len=cfg.min_doc_len,
+        prefetch_batches=cfg.prefetch_batches,
+        shuffle_buffer=cfg.shuffle_buffer,
         seed=cfg.seed,
-        add_special_tokens=False,
+        add_special_tokens=cfg.add_special_tokens,
     )
 
     # Resume from checkpoint if exists
@@ -281,5 +291,5 @@ def main(cfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
-    config = chz.entrypoint(TrainConfig)
+    config = chz.entrypoint(TrainConfig, allow_hyphens=True)
     main(config)

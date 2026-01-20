@@ -53,7 +53,7 @@ class TrainConfig:
     log_every: int = 10
     checkpoint_every: int = 500
     checkpoint_dir: str = "checkpoints/sft"
-    wandb_project: str | None = None
+    wandb_project: str | None = "nanomoe"
     wandb_name: str | None = None
 
     # System

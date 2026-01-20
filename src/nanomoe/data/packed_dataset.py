@@ -51,7 +51,7 @@ class PackedPretrainDataset:
         text_key: str = "text",
         min_doc_len: int = 64,  # Skip very short documents
         prefetch_batches: int = 4,
-        shuffle_buffer: int = 10_000,
+        shuffle_buffer: int | None = 10_000,
         seed: int = 42,
         add_special_tokens: bool = False,
         tokenize_fn: Callable[[dict, Any], list[int]] | None = None,
@@ -89,8 +89,10 @@ class PackedPretrainDataset:
 
     def _get_stream_iter(self) -> Iterator:
         """Get a fresh iterator over the dataset."""
-        ds = self.hf_dataset.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer)
-        return iter(ds)
+        if self.shuffle_buffer is not None and self.shuffle_buffer > 0:
+            ds = self.hf_dataset.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer)
+            return iter(ds)
+        return iter(self.hf_dataset)
 
     def _pack_documents(self, doc_tokens: list[list[int]]) -> PackedBatch:
         """Pack a list of tokenized documents into a single batch."""

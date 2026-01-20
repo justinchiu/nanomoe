@@ -18,6 +18,7 @@ from torch.optim import Optimizer
 
 from nanomoe.data.packing import pack_sequences
 from nanomoe.data.types import PackedBatch, Sample
+from nanomoe.train.loss import unified_loss
 
 logger = logging.getLogger(__name__)
 
@@ -134,18 +135,21 @@ def grpo_loss(
     )
 
     logits = outputs.logits.squeeze(0)  # (seq_len, vocab)
+    labels = packed_batch.labels.to(device) if packed_batch.labels is not None else None
+    if labels is None:
+        labels = tokens.clone()
+        labels[:-1] = tokens[1:]
+        labels[-1] = tokens[-1]
 
-    # Compute log probs for each token
+    loss = unified_loss(logits, labels, token_weights)
+
+    # Compute log probs for metrics
     log_probs = torch.log_softmax(logits[:-1], dim=-1)  # (seq_len-1, vocab)
     token_log_probs = log_probs.gather(-1, tokens[1:].unsqueeze(-1)).squeeze(-1)  # (seq_len-1,)
 
-    weights = token_weights[1:].float()
+    weights = token_weights[:-1].float()
     response_mask = weights.ne(0)
-    masked_log_probs = token_log_probs * weights
     denom = response_mask.sum().clamp(min=1)
-
-    # Policy gradient loss: -E[advantage * log_prob]
-    loss = -masked_log_probs.sum() / denom
 
     # Compute metrics
     with torch.no_grad():
