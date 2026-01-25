@@ -29,15 +29,29 @@ class PackedBatch:
     log_probs: Tensor | None = None  # (total_response_tokens,)
     rewards: Tensor | None = None  # (num_seqs,)
 
-    def to(self, device: torch.device) -> "PackedBatch":
+    def to(
+        self,
+        device: torch.device,
+        non_blocking: bool = False,
+        pin_memory: bool = False,
+    ) -> "PackedBatch":
+        def _maybe_pin(tensor: Tensor) -> Tensor:
+            if pin_memory and tensor.device.type == "cpu":
+                return tensor.pin_memory()
+            return tensor
+
         return PackedBatch(
-            tokens=self.tokens.to(device),
-            position_ids=self.position_ids.to(device),
-            cu_seqlens=self.cu_seqlens.to(device),
-            token_weights=self.token_weights.to(device),
-            labels=self.labels.to(device) if self.labels is not None else None,
-            log_probs=self.log_probs.to(device) if self.log_probs is not None else None,
-            rewards=self.rewards.to(device) if self.rewards is not None else None,
+            tokens=_maybe_pin(self.tokens).to(device, non_blocking=non_blocking),
+            position_ids=_maybe_pin(self.position_ids).to(device, non_blocking=non_blocking),
+            cu_seqlens=_maybe_pin(self.cu_seqlens).to(device, non_blocking=non_blocking),
+            token_weights=_maybe_pin(self.token_weights).to(device, non_blocking=non_blocking),
+            labels=_maybe_pin(self.labels).to(device, non_blocking=non_blocking) if self.labels is not None else None,
+            log_probs=_maybe_pin(self.log_probs).to(device, non_blocking=non_blocking)
+            if self.log_probs is not None
+            else None,
+            rewards=_maybe_pin(self.rewards).to(device, non_blocking=non_blocking)
+            if self.rewards is not None
+            else None,
         )
 
 

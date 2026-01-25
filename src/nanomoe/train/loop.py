@@ -15,6 +15,7 @@ from torch.optim import Optimizer
 from nanomoe.data.types import PackedBatch
 from nanomoe.train.checkpoint import Checkpointer
 from nanomoe.train.logging import Logger
+from nanomoe.train.prefetch import PrefetchConfig, maybe_prefetch
 
 
 class TrainLoopConfig(BaseModel):
@@ -54,11 +55,21 @@ def train_loop(
     grad_scaler: GradScaler | None = None,
     autocast_dtype: torch.dtype | None = None,
     token_count_fn: Callable[[PackedBatch], int] = _default_token_count,
+    prefetch_config: PrefetchConfig | None = None,
 ) -> TrainState:
     if state is None:
         state = TrainState()
 
     device = next(model.parameters()).device
+    if prefetch_config is not None:
+        data_iter = maybe_prefetch(data_iter, device, prefetch_config)
+        if data_iter_factory is not None:
+            factory = data_iter_factory
+
+            def wrapped_factory() -> Iterator[PackedBatch]:
+                return maybe_prefetch(factory(), device, prefetch_config)
+
+            data_iter_factory = wrapped_factory
     autocast_ctx = (
         torch.autocast(device_type=device.type, dtype=autocast_dtype)
         if autocast_dtype is not None and device.type in {"cuda", "cpu"}

@@ -22,6 +22,7 @@ from nanomoe.data import PackedBatch, PackedPretrainDataset, create_document_mas
 from nanomoe.model import MoEConfig, create_model
 from nanomoe.train import (
     Checkpointer,
+    PrefetchConfig,
     TrainLoopConfig,
     TrainState,
     WSDConfig,
@@ -77,6 +78,11 @@ class TrainConfig:
     dtype: str = "bfloat16"  # "float32", "float16", "bfloat16"
     compile_model: bool = False  # Use torch.compile
 
+    # Device prefetch
+    device_prefetch: bool = True
+    prefetch_pin_memory: bool = True
+    prefetch_non_blocking: bool = True
+
 
 def compute_loss(
     model: Any,  # Can be MoETransformer or torch.compile'd version
@@ -85,8 +91,9 @@ def compute_loss(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, dict]:
     """Compute cross-entropy loss with document masking."""
-    # Move batch to device
-    batch = batch.to(device)
+    # Move batch to device if not already prefetched.
+    if batch.tokens.device != device:
+        batch = batch.to(device, non_blocking=True)
 
     # Create document-aware attention mask
     attention_mask = create_document_mask(batch.cu_seqlens, dtype=dtype)
@@ -255,6 +262,12 @@ def main(cfg: TrainConfig) -> None:
     def data_iter_factory():
         return iter(dataset)
 
+    prefetch_config = PrefetchConfig(
+        enabled=cfg.device_prefetch,
+        pin_memory=cfg.prefetch_pin_memory,
+        non_blocking=cfg.prefetch_non_blocking,
+    )
+
     try:
         data_iter = data_iter_factory()
 
@@ -271,6 +284,7 @@ def main(cfg: TrainConfig) -> None:
             state=state,
             grad_scaler=scaler,
             autocast_dtype=None if cfg.dtype == "float32" else dtype,
+            prefetch_config=prefetch_config,
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")

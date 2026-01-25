@@ -20,6 +20,7 @@ from nanomoe.train.logging import (
 from nanomoe.train.loop import TrainLoopConfig, TrainState, train_loop
 from nanomoe.train.loss import unified_loss
 from nanomoe.train.lr_scheduler import ConstantScheduler, CosineScheduler, WSDConfig, WSDScheduler
+from nanomoe.train.prefetch import DevicePrefetcher, PrefetchConfig, maybe_prefetch
 
 __all__ = [
     # GRPO
@@ -36,6 +37,10 @@ __all__ = [
     "TrainLoopConfig",
     "TrainState",
     "train_loop",
+    # Prefetch
+    "DevicePrefetcher",
+    "PrefetchConfig",
+    "maybe_prefetch",
     # Checkpointing
     "Checkpointer",
     "CheckpointState",
