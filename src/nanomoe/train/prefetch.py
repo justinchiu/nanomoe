@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import fields, is_dataclass, replace
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import torch
 from pydantic import BaseModel, ConfigDict
@@ -35,29 +35,35 @@ def _move_to_device(
     non_blocking: bool,
 ) -> T:
     if obj is None:
-        return obj
+        return cast(T, obj)
     if isinstance(obj, Tensor):
         tensor = _pin_tensor(obj, pin_memory)
         if tensor.device == device:
-            return tensor
-        return tensor.to(device, non_blocking=non_blocking)
+            return cast(T, tensor)
+        return cast(T, tensor.to(device, non_blocking=non_blocking))
     if isinstance(obj, dict):
-        return {k: _move_to_device(v, device, pin_memory=pin_memory, non_blocking=non_blocking) for k, v in obj.items()}  # type: ignore[return-value]
+        return cast(
+            T,
+            {k: _move_to_device(v, device, pin_memory=pin_memory, non_blocking=non_blocking) for k, v in obj.items()},
+        )
     if isinstance(obj, tuple):
         values = [_move_to_device(v, device, pin_memory=pin_memory, non_blocking=non_blocking) for v in obj]
         if hasattr(obj, "_fields"):
-            return type(obj)(*values)  # type: ignore[return-value]
-        return tuple(values)  # type: ignore[return-value]
+            return cast(T, type(obj)(*values))
+        return cast(T, tuple(values))
     if isinstance(obj, list):
-        return [_move_to_device(v, device, pin_memory=pin_memory, non_blocking=non_blocking) for v in obj]  # type: ignore[return-value]
+        return cast(
+            T,
+            [_move_to_device(v, device, pin_memory=pin_memory, non_blocking=non_blocking) for v in obj],
+        )
     if hasattr(obj, "to") and callable(obj.to):
         try:
-            return obj.to(device, non_blocking=non_blocking, pin_memory=pin_memory)  # type: ignore[attr-defined]
+            return cast(T, obj.to(device, non_blocking=non_blocking, pin_memory=pin_memory))  # type: ignore[attr-defined]
         except TypeError:
             try:
-                return obj.to(device, non_blocking=non_blocking)  # type: ignore[attr-defined]
+                return cast(T, obj.to(device, non_blocking=non_blocking))  # type: ignore[attr-defined]
             except TypeError:
-                return obj.to(device)  # type: ignore[attr-defined]
+                return cast(T, obj.to(device))  # type: ignore[attr-defined]
     if is_dataclass(obj):
         values = {}
         for field in fields(obj):
@@ -69,8 +75,9 @@ def _move_to_device(
                 pin_memory=pin_memory,
                 non_blocking=non_blocking,
             )
-        return replace(obj, **values)
-    return obj
+        dataclass_obj = cast(Any, obj)
+        return cast(T, replace(dataclass_obj, **values))
+    return cast(T, obj)
 
 
 def _record_stream(obj: Any, stream: torch.cuda.Stream) -> None:
@@ -84,12 +91,12 @@ def _record_stream(obj: Any, stream: torch.cuda.Stream) -> None:
         for value in obj.values():
             _record_stream(value, stream)
         return
-    if isinstance(obj, (tuple, list)):
+    if isinstance(obj, tuple | list):
         for value in obj:
             _record_stream(value, stream)
         return
     if hasattr(obj, "record_stream") and callable(obj.record_stream):
-        obj.record_stream(stream)  # type: ignore[attr-defined]
+        obj.record_stream(stream)
         return
     if is_dataclass(obj):
         for field in fields(obj):

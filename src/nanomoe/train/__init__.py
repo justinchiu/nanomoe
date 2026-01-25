@@ -17,7 +17,7 @@ from nanomoe.train.logging import (
     WandbLogger,
     setup_logging,
 )
-from nanomoe.train.loop import TrainLoopConfig, TrainState, train_loop
+from nanomoe.train.loop import CudaProfilerConfig, TrainLoopConfig, TrainState, train_loop
 from nanomoe.train.loss import unified_loss
 from nanomoe.train.lr_scheduler import ConstantScheduler, CosineScheduler, WSDConfig, WSDScheduler
 from nanomoe.train.prefetch import DevicePrefetcher, PrefetchConfig, maybe_prefetch
@@ -36,6 +36,7 @@ __all__ = [
     # Loop
     "TrainLoopConfig",
     "TrainState",
+    "CudaProfilerConfig",
     "train_loop",
     # Prefetch
     "DevicePrefetcher",

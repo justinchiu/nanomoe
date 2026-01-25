@@ -22,6 +22,7 @@ from nanomoe.data import PackedBatch, PackedPretrainDataset, create_document_mas
 from nanomoe.model import MoEConfig, create_model
 from nanomoe.train import (
     Checkpointer,
+    CudaProfilerConfig,
     PrefetchConfig,
     TrainLoopConfig,
     TrainState,
@@ -82,6 +83,11 @@ class TrainConfig:
     device_prefetch: bool = True
     prefetch_pin_memory: bool = True
     prefetch_non_blocking: bool = True
+
+    # Profiling (Nsight Systems via torch.cuda.profiler)
+    profile_cuda: bool = False
+    profile_start_step: int = 1
+    profile_steps: int = 5
 
 
 def compute_loss(
@@ -148,6 +154,8 @@ def main(cfg: TrainConfig) -> None:
     dtype = dtype_map[cfg.dtype]
 
     print(f"Device: {device}, dtype: {dtype}")
+    if cfg.profile_cuda and device.type != "cuda":
+        print("Warning: CUDA profiling requested but CUDA is unavailable; profiling disabled.")
 
     # Create model config
     model_config = getattr(MoEConfig, cfg.model_preset)()
@@ -267,6 +275,11 @@ def main(cfg: TrainConfig) -> None:
         pin_memory=cfg.prefetch_pin_memory,
         non_blocking=cfg.prefetch_non_blocking,
     )
+    profiler_config = CudaProfilerConfig(
+        enabled=cfg.profile_cuda,
+        start_step=cfg.profile_start_step,
+        profile_steps=cfg.profile_steps,
+    )
 
     try:
         data_iter = data_iter_factory()
@@ -285,6 +298,7 @@ def main(cfg: TrainConfig) -> None:
             grad_scaler=scaler,
             autocast_dtype=None if cfg.dtype == "float32" else dtype,
             prefetch_config=prefetch_config,
+            profile_config=profiler_config,
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")

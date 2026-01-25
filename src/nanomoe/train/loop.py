@@ -29,6 +29,14 @@ class TrainLoopConfig(BaseModel):
     max_grad_norm: float = 1.0
 
 
+class CudaProfilerConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    enabled: bool = False
+    start_step: int = 1
+    profile_steps: int = 5
+
+
 class TrainState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
@@ -56,6 +64,7 @@ def train_loop(
     autocast_dtype: torch.dtype | None = None,
     token_count_fn: Callable[[PackedBatch], int] = _default_token_count,
     prefetch_config: PrefetchConfig | None = None,
+    profile_config: CudaProfilerConfig | None = None,
 ) -> TrainState:
     if state is None:
         state = TrainState()
@@ -76,90 +85,143 @@ def train_loop(
         else nullcontext()
     )
 
+    profile_enabled = (
+        profile_config is not None
+        and profile_config.enabled
+        and profile_config.profile_steps > 0
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+    )
+    profile_active = False
+    profile_start = max(1, profile_config.start_step) if profile_enabled else 0
+    profile_end = profile_start + profile_config.profile_steps - 1 if profile_enabled else 0
+
     accumulated_metrics: dict[str, float] = {}
     accumulated_tokens = 0
     start_time = time.time()
 
-    while state.step < cfg.max_steps:
-        if cfg.max_tokens is not None and state.tokens_seen >= cfg.max_tokens:
-            break
+    try:
+        while state.step < cfg.max_steps:
+            if cfg.max_tokens is not None and state.tokens_seen >= cfg.max_tokens:
+                break
 
-        optimizer.zero_grad()
-        step_tokens = 0
-        step_metrics: dict[str, float] = {}
+            current_step = state.step + 1
+            profile_window = profile_enabled and profile_start <= current_step <= profile_end
 
-        for _ in range(cfg.gradient_accumulation):
+            if profile_enabled and not profile_active and current_step == profile_start:
+                torch.cuda.synchronize()
+                torch.cuda.profiler.start()
+                profile_active = True
+
+            if profile_window:
+                torch.cuda.nvtx.range_push("train_step")
             try:
-                batch = next(data_iter)
-            except StopIteration:
-                if data_iter_factory is None:
-                    raise
-                data_iter = data_iter_factory()
-                batch = next(data_iter)
+                optimizer.zero_grad()
+                step_tokens = 0
+                step_metrics: dict[str, float] = {}
 
-            step_tokens += token_count_fn(batch)
+                for _ in range(cfg.gradient_accumulation):
+                    if profile_window:
+                        torch.cuda.nvtx.range_push("data_fetch")
+                    try:
+                        try:
+                            batch = next(data_iter)
+                        except StopIteration:
+                            if data_iter_factory is None:
+                                raise
+                            data_iter = data_iter_factory()
+                            batch = next(data_iter)
+                    finally:
+                        if profile_window:
+                            torch.cuda.nvtx.range_pop()
 
-            with autocast_ctx:
-                loss, metrics = step_fn(batch)
+                    step_tokens += token_count_fn(batch)
 
-            scaled_loss = loss / cfg.gradient_accumulation
-            if grad_scaler is not None:
-                grad_scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+                    if profile_window:
+                        torch.cuda.nvtx.range_push("forward_backward")
+                    try:
+                        with autocast_ctx:
+                            loss, metrics = step_fn(batch)
 
-            for k, v in metrics.items():
-                if isinstance(v, int | float):
-                    scale = 1.0 if k.startswith("num_") else 1.0 / cfg.gradient_accumulation
-                    step_metrics[k] = step_metrics.get(k, 0.0) + float(v) * scale
+                        scaled_loss = loss / cfg.gradient_accumulation
+                        if grad_scaler is not None:
+                            grad_scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+                    finally:
+                        if profile_window:
+                            torch.cuda.nvtx.range_pop()
 
-        if grad_scaler is not None:
-            grad_scaler.unscale_(optimizer)
-            if cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-        else:
-            if cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            optimizer.step()
+                    for k, v in metrics.items():
+                        if isinstance(v, int | float):
+                            scale = 1.0 if k.startswith("num_") else 1.0 / cfg.gradient_accumulation
+                            step_metrics[k] = step_metrics.get(k, 0.0) + float(v) * scale
 
-        state.tokens_seen += step_tokens
-        lr = None
-        if scheduler is not None:
-            try:
-                lr = scheduler.step(step=state.step, tokens_seen=state.tokens_seen)
-            except TypeError:
-                lr = scheduler.step()
+                if profile_window:
+                    torch.cuda.nvtx.range_push("optimizer_step")
+                try:
+                    if grad_scaler is not None:
+                        grad_scaler.unscale_(optimizer)
+                        if cfg.max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                        grad_scaler.step(optimizer)
+                        grad_scaler.update()
+                    else:
+                        if cfg.max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                        optimizer.step()
+                finally:
+                    if profile_window:
+                        torch.cuda.nvtx.range_pop()
 
-        state.step += 1
+                state.tokens_seen += step_tokens
+                lr = None
+                if scheduler is not None:
+                    try:
+                        lr = scheduler.step(step=state.step, tokens_seen=state.tokens_seen)
+                    except TypeError:
+                        lr = scheduler.step()
 
-        for k, v in step_metrics.items():
-            accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + v
-        accumulated_tokens += step_tokens
+                state.step += 1
 
-        if logger is not None and state.step % cfg.log_every == 0:
-            elapsed = time.time() - start_time
-            log_metrics = {f"train/{k}": v / cfg.log_every for k, v in accumulated_metrics.items()}
-            if lr is not None:
-                log_metrics["train/lr"] = lr
-            log_metrics["train/step"] = state.step
-            log_metrics["train/tokens_seen"] = state.tokens_seen
-            log_metrics["perf/tokens_per_sec"] = accumulated_tokens / max(elapsed, 1e-6)
-            log_metrics["perf/elapsed_time"] = elapsed
-            logger.log_metrics(log_metrics, step=state.step)
+                for k, v in step_metrics.items():
+                    accumulated_metrics[k] = accumulated_metrics.get(k, 0.0) + v
+                accumulated_tokens += step_tokens
 
-            accumulated_metrics.clear()
-            accumulated_tokens = 0
-            start_time = time.time()
+                if logger is not None and state.step % cfg.log_every == 0:
+                    elapsed = time.time() - start_time
+                    log_metrics = {f"train/{k}": v / cfg.log_every for k, v in accumulated_metrics.items()}
+                    if lr is not None:
+                        log_metrics["train/lr"] = lr
+                    log_metrics["train/step"] = state.step
+                    log_metrics["train/tokens_seen"] = state.tokens_seen
+                    log_metrics["perf/tokens_per_sec"] = accumulated_tokens / max(elapsed, 1e-6)
+                    log_metrics["perf/elapsed_time"] = elapsed
+                    logger.log_metrics(log_metrics, step=state.step)
 
-        if checkpointer is not None and state.step % cfg.checkpoint_every == 0:
-            checkpointer.save(
-                step=state.step,
-                model=model,
-                optimizer=optimizer,
-                tokens_seen=state.tokens_seen,
-                scheduler=scheduler,
-            )
+                    accumulated_metrics.clear()
+                    accumulated_tokens = 0
+                    start_time = time.time()
+
+                if checkpointer is not None and state.step % cfg.checkpoint_every == 0:
+                    checkpointer.save(
+                        step=state.step,
+                        model=model,
+                        optimizer=optimizer,
+                        tokens_seen=state.tokens_seen,
+                        scheduler=scheduler,
+                    )
+            finally:
+                if profile_window:
+                    torch.cuda.nvtx.range_pop()
+
+            if profile_active and current_step >= profile_end:
+                torch.cuda.synchronize()
+                torch.cuda.profiler.stop()
+                profile_active = False
+    finally:
+        if profile_active:
+            torch.cuda.synchronize()
+            torch.cuda.profiler.stop()
 
     return state

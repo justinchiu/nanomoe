@@ -12,6 +12,9 @@ MAX_EXAMPLES=${MAX_EXAMPLES:-200}
 LOG_EVERY=${LOG_EVERY:-1}
 SKIP_STEPS=${SKIP_STEPS:-2}
 DEVICE_PREFETCH=false
+PROFILE_CUDA=${PROFILE_CUDA:-true}
+PROFILE_START_STEP=${PROFILE_START_STEP:-1}
+PROFILE_STEPS=${PROFILE_STEPS:-5}
 
 uv run python -m nanomoe.experiments.pretrain \
   --max_steps="${MAX_STEPS}" \
@@ -26,6 +29,9 @@ uv run python -m nanomoe.experiments.pretrain \
   --wandb_project= \
   --checkpoint_dir="${CHECKPOINT_DIR}" \
   --device_prefetch="${DEVICE_PREFETCH}" \
+  --profile_cuda="${PROFILE_CUDA}" \
+  --profile_start_step="${PROFILE_START_STEP}" \
+  --profile_steps="${PROFILE_STEPS}" \
   --checkpoint_every=1000000 \
   --gradient_accumulation=1
 
