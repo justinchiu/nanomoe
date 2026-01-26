@@ -71,10 +71,10 @@ class WandbLogger(Logger):
         config: Any = None,
         mode: str = "online",  # "online", "offline", "disabled"
         dir: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ):
         try:
-            import wandb  # ty: ignore[unresolved-import]
+            import wandb
 
             self._wandb = wandb
         except ImportError as err:
@@ -88,7 +88,7 @@ class WandbLogger(Logger):
         if dir:
             os.makedirs(dir, exist_ok=True)
 
-        init_kwargs = {
+        init_kwargs: dict[str, Any] = {
             "project": project,
             "name": name,
             "group": group,

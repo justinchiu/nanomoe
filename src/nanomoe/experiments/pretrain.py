@@ -15,6 +15,7 @@ from typing import Any
 import chz
 import datasets
 import torch
+import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 from transformers import AutoTokenizer
 
@@ -28,6 +29,8 @@ from nanomoe.train import (
     TrainState,
     WSDConfig,
     WSDScheduler,
+    cleanup_distributed,
+    init_distributed,
     setup_logging,
     train_loop,
     unified_loss,
@@ -78,6 +81,7 @@ class TrainConfig:
     seed: int = 42
     dtype: str = "bfloat16"  # "float32", "float16", "bfloat16"
     compile_model: bool = False  # Use torch.compile
+    distributed: bool = False  # Use torch.distributed + DDP
 
     # Device prefetch
     device_prefetch: bool = True
@@ -139,10 +143,22 @@ def compute_loss(
 
 
 def main(cfg: TrainConfig) -> None:
+    distributed_enabled = cfg.distributed
+    if distributed_enabled:
+        init_distributed()
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    is_primary = rank == 0
+
+    def log(msg: str) -> None:
+        if is_primary:
+            print(msg)
+
     # Set seed
-    torch.manual_seed(cfg.seed)
+    torch.manual_seed(cfg.seed + rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.seed)
+        torch.cuda.manual_seed_all(cfg.seed + rank)
 
     # Device and dtype
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -153,9 +169,9 @@ def main(cfg: TrainConfig) -> None:
     }
     dtype = dtype_map[cfg.dtype]
 
-    print(f"Device: {device}, dtype: {dtype}")
+    log(f"Device: {device}, dtype: {dtype}")
     if cfg.profile_cuda and device.type != "cuda":
-        print("Warning: CUDA profiling requested but CUDA is unavailable; profiling disabled.")
+        log("Warning: CUDA profiling requested but CUDA is unavailable; profiling disabled.")
 
     # Create model config
     model_config = getattr(MoEConfig, cfg.model_preset)()
@@ -164,21 +180,21 @@ def main(cfg: TrainConfig) -> None:
     if cfg.num_experts_per_tok is not None:
         model_config.num_experts_per_tok = cfg.num_experts_per_tok
 
-    print(f"Model config: {cfg.model_preset}")
-    print(f"  num_experts: {model_config.num_experts}")
-    print(f"  num_experts_per_tok: {model_config.num_experts_per_tok}")
-    print(f"  hidden_size: {model_config.hidden_size}")
-    print(f"  num_layers: {model_config.num_layers}")
-    print(f"  Total params: ~{model_config.num_total_params / 1e6:.1f}M")
-    print(f"  Active params: ~{model_config.num_active_params / 1e6:.1f}M")
+    log(f"Model config: {cfg.model_preset}")
+    log(f"  num_experts: {model_config.num_experts}")
+    log(f"  num_experts_per_tok: {model_config.num_experts_per_tok}")
+    log(f"  hidden_size: {model_config.hidden_size}")
+    log(f"  num_layers: {model_config.num_layers}")
+    log(f"  Total params: ~{model_config.num_total_params / 1e6:.1f}M")
+    log(f"  Active params: ~{model_config.num_active_params / 1e6:.1f}M")
 
     # Load tokenizer and update vocab size
-    print(f"Loading tokenizer: {cfg.tokenizer_name}")
+    log(f"Loading tokenizer: {cfg.tokenizer_name}")
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name, trust_remote_code=True)
     model_config.vocab_size = len(tokenizer)
 
     # Create model
-    print("Creating model...")
+    log("Creating model...")
     model = create_model(model_config)
     model = model.to(device=device, dtype=dtype)
     model.train()
@@ -187,10 +203,17 @@ def main(cfg: TrainConfig) -> None:
     model_for_checkpoint = model
 
     if cfg.compile_model and torch.cuda.is_available():
-        print("Compiling model with torch.compile...")
+        log("Compiling model with torch.compile...")
         model.compile()
 
-    print(f"Model parameters: {model.num_parameters() / 1e6:.2f}M")
+    log(f"Model parameters: {model.num_parameters() / 1e6:.2f}M")
+
+    if dist.is_initialized():
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[torch.cuda.current_device()],
+            output_device=torch.cuda.current_device(),
+        )
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -221,11 +244,17 @@ def main(cfg: TrainConfig) -> None:
         console=True,
         console_every=cfg.log_every,
         config=cfg,
+        rank=rank,
     )
 
     # Load dataset
-    print(f"Loading dataset: {cfg.dataset_name}/{cfg.dataset_config}")
+    log(f"Loading dataset: {cfg.dataset_name}/{cfg.dataset_config}")
     hf_dataset = datasets.load_dataset(cfg.dataset_name, cfg.dataset_config, streaming=True, split="train")
+    if dist.is_initialized():
+        if hasattr(hf_dataset, "shard"):
+            hf_dataset = hf_dataset.shard(num_shards=world_size, index=rank)
+        else:
+            raise ValueError("Dataset does not support sharding for distributed training.")
     if cfg.max_examples is not None:
         if hasattr(hf_dataset, "take"):
             hf_dataset = hf_dataset.take(cfg.max_examples)
@@ -250,13 +279,13 @@ def main(cfg: TrainConfig) -> None:
     resume_step, resume_tokens = checkpointer.load(model_for_checkpoint, optimizer, scheduler)
     state = TrainState(step=resume_step, tokens_seen=resume_tokens)
     if resume_step > 0:
-        print(f"Resumed from step {state.step}, tokens_seen {state.tokens_seen}")
+        log(f"Resumed from step {state.step}, tokens_seen {state.tokens_seen}")
 
     # Gradient scaler for mixed precision
     scaler = GradScaler() if cfg.dtype == "float16" else None
 
-    print(f"Starting training for {cfg.max_steps} steps...")
-    print(f"Pack size: {cfg.pack_size}, batch size: {cfg.batch_size}, grad accum: {cfg.gradient_accumulation}")
+    log(f"Starting training for {cfg.max_steps} steps...")
+    log(f"Pack size: {cfg.pack_size}, batch size: {cfg.batch_size}, grad accum: {cfg.gradient_accumulation}")
 
     loop_cfg = TrainLoopConfig(
         max_steps=cfg.max_steps,
@@ -301,7 +330,7 @@ def main(cfg: TrainConfig) -> None:
             profile_config=profiler_config,
         )
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
+        log("\nTraining interrupted by user")
     finally:
         dataset.stop()
 
@@ -315,7 +344,10 @@ def main(cfg: TrainConfig) -> None:
     checkpointer.wait()
 
     logger.close()
-    print(f"Training complete. Final step: {state.step}, tokens_seen: {state.tokens_seen}")
+    log(f"Training complete. Final step: {state.step}, tokens_seen: {state.tokens_seen}")
+
+    if distributed_enabled:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
