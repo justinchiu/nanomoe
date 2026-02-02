@@ -79,14 +79,13 @@ def eager_mm_experts_forward(
     # Also there were no speedup gains from it in my experiments, even in eager mode.
     selected_gate_up = self.gate_up_proj
     selected_down = self.down_proj
-    selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_g] if self.has_bias else None
-    selected_down_bias = self.down_proj_bias[expert_ids_g] if self.has_bias else None
-
+    selected_gate_up_bias = self.gate_up_proj_bias if self.has_bias else None
+    selected_down_bias = self.down_proj_bias if self.has_bias else None
     # Compute offsets for grouped_mm
     # using histc instead of bincount to avoid cuda graph issues
     # With deterministic algorithms, CPU only supports float input, CUDA only supports int input.
     histc_input = expert_ids_g.float() if device.type == "cpu" else expert_ids_g.int()
-    num_tokens_per_expert = torch.histc(histc_input, bins=self.num_experts, min=0)
+    num_tokens_per_expert = torch.histc(histc_input, bins=self.num_experts, min=0, max=self.num_experts - 1)
     start_idx = 0
     outputs = []
     for i, num_token in enumerate(num_tokens_per_expert):
@@ -104,15 +103,16 @@ def eager_mm_experts_forward(
         )
         expert_out = down_fn(expert_out, gate_down) + gate_down_bias
         outputs.append(expert_out)
-    outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-    new_x = torch.empty_like(outs)
-    new_x[perm] = outs
+        start_idx = end_idx
+    outs = torch.cat(outputs, dim=0) if len(outputs) else selected_hidden_states_g.new_empty(0)
+    outs = outs * sample_weights_g.unsqueeze(-1)  # (S, hidden_dim)
+    outs = outs[inv_perm]
     final_out = (
-        new_x.view(*top_k_index.shape, -1)
+        outs.view(*top_k_index.shape, -1)
         .type(top_k_weights.dtype)
-        .mul_(top_k_weights.unsqueeze(dim=-1))
+        # .mul_(top_k_weights.unsqueeze(dim=-1))
         .sum(dim=1)
-        .type(new_x.dtype)
+        .type(outs.dtype)
     )
     return final_out
 
@@ -180,10 +180,8 @@ def grouped_mm_experts_forward(
     out_per_sample_g = _grouped_linear(
         gated_out, selected_down, selected_down_bias, offsets, is_transposed=self.is_transposed
     )  # (S, hidden_dim)
-
     # Apply routing weights
     out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)  # (S, hidden_dim)
-
     # Restore original order
     out_per_sample = out_per_sample_g[inv_perm]
 

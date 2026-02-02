@@ -1,4 +1,8 @@
-"""Tests for MoE kernel implementations."""
+"""
+Tests for MoE kernel implementations.
+For running full test set:
+NANOMOE_RUN_PERF=1 pytest -s tests/test_moe.py
+"""
 
 from __future__ import annotations
 
@@ -91,15 +95,15 @@ def _call_eager_or_skip(
 
 @pytest.mark.parametrize("is_transposed", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_grouped_mm_matches_naive_forward_backward(is_transposed: bool, has_bias: bool) -> None:
+def test_grouped_mm_matches_eager_forward_backward(is_transposed: bool, has_bias: bool) -> None:
     if not hasattr(torch, "_grouped_mm"):
         pytest.skip("torch._grouped_mm is not available")
 
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    num_experts = 8
-    num_top_k = 2
+    num_experts = 16
+    num_top_k = 4
     num_tokens = 16
     hidden_dim = 32
     intermediate_dim = 64
@@ -119,14 +123,13 @@ def test_grouped_mm_matches_naive_forward_backward(is_transposed: bool, has_bias
     top_k_index, top_k_weights = _make_topk(
         num_tokens, num_experts, num_top_k, device=device
     )
-
+    # print(top_k_index, top_k_weights)
     out_grouped = grouped_mm_experts_forward(
         module, hidden, top_k_index, top_k_weights
     )
     out_ref = eager_mm_experts_forward(
         module_ref, hidden_ref, top_k_index, top_k_weights
     )
-
     torch.testing.assert_close(out_grouped, out_ref, rtol=1e-4, atol=1e-4)
 
     loss_grouped = out_grouped.pow(2).mean()
@@ -147,123 +150,154 @@ def test_grouped_mm_matches_naive_forward_backward(is_transposed: bool, has_bias
         )
 
 
-# @pytest.mark.parametrize("is_transposed", [False, True])
-# @pytest.mark.parametrize("has_bias", [False, True])
-# def test_eager_vs_grouped_forward_backward(is_transposed: bool, has_bias: bool) -> None:
-#     if not hasattr(torch, "_grouped_mm"):
-#         pytest.skip("torch._grouped_mm is not available")
 
-#     torch.manual_seed(1)
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+@pytest.mark.skipif(os.getenv("NANOMOE_RUN_PERF") != "1", reason="perf tests opt-in")
+def test_grouped_mm_efficiency_smoke() -> None:
+    if not hasattr(torch, "_grouped_mm"):
+        pytest.skip("torch._grouped_mm is not available")
 
-#     num_experts = 8
-#     num_top_k = 2
-#     num_tokens = 16
-#     hidden_dim = 32
-#     intermediate_dim = 64
+    torch.manual_seed(2)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-#     base_module = ToyMoEKernel(
-#         num_experts,
-#         hidden_dim,
-#         intermediate_dim,
-#         has_bias=has_bias,
-#         is_transposed=is_transposed,
-#     ).to(device)
+    num_experts = 128
+    num_top_k = 8
+    num_tokens = 1024
+    hidden_dim = 256
+    intermediate_dim = 512
 
-#     module_eager = copy.deepcopy(base_module)
-#     module_grouped = copy.deepcopy(base_module)
+    module = ToyMoEKernel(
+        num_experts,
+        hidden_dim,
+        intermediate_dim,
+        has_bias=True,
+        is_transposed=False,
+    ).to(device)
 
-#     hidden_eager = torch.randn(
-#         num_tokens, hidden_dim, device=device, requires_grad=True
-#     )
-#     hidden_grouped = hidden_eager.detach().clone().requires_grad_(True)
+    hidden = torch.randn(num_tokens, hidden_dim, device=device)
+    top_k_index, top_k_weights = _make_topk(
+        num_tokens, num_experts, num_top_k, device=device
+    )
 
-#     top_k_index, top_k_weights = _make_topk(
-#         num_tokens, num_experts, num_top_k, device=device
-#     )
+    def run_grouped() -> None:
+        grouped_mm_experts_forward(module, hidden, top_k_index, top_k_weights)
 
-#     out_eager = _call_eager_or_skip(
-#         module_eager, hidden_eager, top_k_index, top_k_weights
-#     )
-#     out_grouped = grouped_mm_experts_forward(
-#         module_grouped, hidden_grouped, top_k_index, top_k_weights
-#     )
+    def run_naive() -> None:
+        eager_mm_experts_forward(module, hidden, top_k_index, top_k_weights)
 
-#     torch.testing.assert_close(out_eager, out_grouped, rtol=1e-4, atol=1e-4)
+    iters = 5
+    with torch.no_grad():
+        run_grouped()
+        run_naive()
 
-#     loss_eager = out_eager.pow(2).mean()
-#     loss_grouped = out_grouped.pow(2).mean()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
 
-#     loss_eager.backward()
-#     loss_grouped.backward()
+        start = time.perf_counter()
+        for _ in range(iters):
+            run_grouped()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        grouped_time = (time.perf_counter() - start) / iters
 
-#     torch.testing.assert_close(
-#         hidden_eager.grad, hidden_grouped.grad, rtol=1e-4, atol=1e-4
-#     )
-
-#     grouped_params = dict(module_grouped.named_parameters())
-#     for name, param in module_eager.named_parameters():
-#         torch.testing.assert_close(
-#             param.grad,
-#             grouped_params[name].grad,
-#             rtol=1e-4,
-#             atol=1e-4,
-#         )
+        start = time.perf_counter()
+        for _ in range(iters):
+            run_naive()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        naive_time = (time.perf_counter() - start) / iters
+    print('grouped_time:', grouped_time)
+    print('eager_time:', naive_time)
+    # assert grouped_time <= naive_time * 5.0
 
 
-# @pytest.mark.skipif(os.getenv("NANOMOE_RUN_PERF") != "1", reason="perf tests opt-in")
-# def test_grouped_mm_efficiency_smoke() -> None:
-#     if not hasattr(torch, "_grouped_mm"):
-#         pytest.skip("torch._grouped_mm is not available")
+@pytest.mark.skipif(os.getenv("NANOMOE_RUN_PERF") != "1", reason="perf tests opt-in")
+def test_grouped_mm_backward_efficiency_and_peak_memory() -> None:
+    if not hasattr(torch, "_grouped_mm"):
+        pytest.skip("torch._grouped_mm is not available")
 
-#     torch.manual_seed(2)
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(3)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-#     num_experts = 16
-#     num_top_k = 2
-#     num_tokens = 512
-#     hidden_dim = 128
-#     intermediate_dim = 256
+    num_experts = 128
+    num_top_k = 8
+    num_tokens = 1024
+    hidden_dim = 256
+    intermediate_dim = 512
 
-#     module = ToyMoEKernel(
-#         num_experts,
-#         hidden_dim,
-#         intermediate_dim,
-#         has_bias=True,
-#         is_transposed=False,
-#     ).to(device)
+    base_module = ToyMoEKernel(
+        num_experts,
+        hidden_dim,
+        intermediate_dim,
+        has_bias=True,
+        is_transposed=False,
+    ).to(device)
 
-#     hidden = torch.randn(num_tokens, hidden_dim, device=device)
-#     top_k_index, top_k_weights = _make_topk(
-#         num_tokens, num_experts, num_top_k, device=device
-#     )
+    module_grouped = copy.deepcopy(base_module)
+    module_eager = copy.deepcopy(base_module)
 
-#     def run_grouped() -> None:
-#         grouped_mm_experts_forward(module, hidden, top_k_index, top_k_weights)
+    hidden_grouped = torch.randn(
+        num_tokens, hidden_dim, device=device, requires_grad=True
+    )
+    hidden_eager = hidden_grouped.detach().clone().requires_grad_(True)
 
-#     def run_naive() -> None:
-#         _naive_moe_forward(module, hidden, top_k_index, top_k_weights)
+    top_k_index, top_k_weights = _make_topk(
+        num_tokens, num_experts, num_top_k, device=device
+    )
 
-#     iters = 5
-#     with torch.no_grad():
-#         run_grouped()
-#         run_naive()
+    def run_grouped() -> torch.Tensor:
+        out = grouped_mm_experts_forward(
+            module_grouped, hidden_grouped, top_k_index, top_k_weights
+        )
+        return out.pow(2).mean()
 
-#         if device.type == "cuda":
-#             torch.cuda.synchronize()
+    def run_eager() -> torch.Tensor:
+        out = _call_eager_or_skip(
+            module_eager, hidden_eager, top_k_index, top_k_weights
+        )
+        return out.pow(2).mean()
 
-#         start = time.perf_counter()
-#         for _ in range(iters):
-#             run_grouped()
-#         if device.type == "cuda":
-#             torch.cuda.synchronize()
-#         grouped_time = (time.perf_counter() - start) / iters
+    def measure(fn, iters: int = 5) -> tuple[float, int | None]:
+        total = 0.0
+        peak = None
+        for _ in range(iters):
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            start = time.perf_counter()
+            loss = fn()
+            loss.backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            total += time.perf_counter() - start
+            if device.type == "cuda":
+                iter_peak = torch.cuda.max_memory_allocated()
+                peak = iter_peak if peak is None else max(peak, iter_peak)
+            module_grouped.zero_grad(set_to_none=True)
+            module_eager.zero_grad(set_to_none=True)
+            hidden_grouped.grad = None
+            hidden_eager.grad = None
+        return total / iters, peak
 
-#         start = time.perf_counter()
-#         for _ in range(iters):
-#             run_naive()
-#         if device.type == "cuda":
-#             torch.cuda.synchronize()
-#         naive_time = (time.perf_counter() - start) / iters
+    with torch.no_grad():
+        run_grouped()
+        run_eager()
 
-#     assert grouped_time <= naive_time * 5.0
+    module_grouped.zero_grad(set_to_none=True)
+    module_eager.zero_grad(set_to_none=True)
+    hidden_grouped.grad = None
+    hidden_eager.grad = None
+
+    grouped_time, grouped_peak = measure(run_grouped)
+    eager_time, eager_peak = measure(run_eager)
+
+    # Print out for visibility
+    print('==== MoE grouped_mm foward-backward efficiency ====')
+    print('grouped_time:', grouped_time)
+    print('eager_time:', eager_time)
+    if device.type == "cuda":
+        print('grouped_peak (MB):', grouped_peak / (1024 * 1024))
+        print('eager_peak (MB):', eager_peak / (1024 * 1024))
+
+    # assert grouped_time <= eager_time * 5.0
+
+    # if grouped_peak is not None and eager_peak is not None:
+    #     assert grouped_peak <= eager_peak * 1.2
