@@ -6,7 +6,7 @@ Features:
 - Optional shared expert
 - Efficient batched expert computation
 """
-
+from packaging.version import parse as V
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
