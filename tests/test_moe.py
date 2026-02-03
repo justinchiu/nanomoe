@@ -123,7 +123,6 @@ def test_grouped_mm_matches_eager_forward_backward(is_transposed: bool, has_bias
     top_k_index, top_k_weights = _make_topk(
         num_tokens, num_experts, num_top_k, device=device
     )
-    # print(top_k_index, top_k_weights)
     out_grouped = grouped_mm_experts_forward(
         module, hidden, top_k_index, top_k_weights
     )
@@ -207,13 +206,12 @@ def test_grouped_mm_efficiency_smoke() -> None:
         naive_time = (time.perf_counter() - start) / iters
     print('grouped_time:', grouped_time)
     print('eager_time:', naive_time)
-    # assert grouped_time <= naive_time * 5.0
 
 
 @pytest.mark.skipif(os.getenv("NANOMOE_RUN_PERF") != "1", reason="perf tests opt-in")
 def test_grouped_mm_backward_efficiency_and_peak_memory() -> None:
-    if not hasattr(torch, "_grouped_mm"):
-        pytest.skip("torch._grouped_mm is not available")
+    if not hasattr(F, "grouped_mm"):
+        pytest.skip("F.grouped_mm is not available")
 
     torch.manual_seed(3)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -290,14 +288,9 @@ def test_grouped_mm_backward_efficiency_and_peak_memory() -> None:
     eager_time, eager_peak = measure(run_eager)
 
     # Print out for visibility
-    print('==== MoE grouped_mm foward-backward efficiency ====')
+    print('==== MoE grouped_mm forward-backward efficiency ====')
     print('grouped_time:', grouped_time)
     print('eager_time:', eager_time)
     if device.type == "cuda":
         print('grouped_peak (MB):', grouped_peak / (1024 * 1024))
         print('eager_peak (MB):', eager_peak / (1024 * 1024))
-
-    # assert grouped_time <= eager_time * 5.0
-
-    # if grouped_peak is not None and eager_peak is not None:
-    #     assert grouped_peak <= eager_peak * 1.2

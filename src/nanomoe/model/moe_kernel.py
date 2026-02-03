@@ -81,6 +81,8 @@ def eager_mm_experts_forward(
     selected_down = self.down_proj
     selected_gate_up_bias = self.gate_up_proj_bias if self.has_bias else None
     selected_down_bias = self.down_proj_bias if self.has_bias else None
+    gate_up_fn = torch.matmul if self.is_transposed else lambda x, y: torch.matmul(x, y.transpose(0, 1))
+    down_fn = torch.matmul if self.is_transposed else lambda x, y: torch.matmul(x, y.transpose(0, 1))
     # Compute offsets for grouped_mm
     # using histc instead of bincount to avoid cuda graph issues
     # With deterministic algorithms, CPU only supports float input, CUDA only supports int input.
@@ -95,8 +97,6 @@ def eager_mm_experts_forward(
         gate_up, gate_down = selected_gate_up[i], selected_down[i]
         gate_up_bias = selected_gate_up_bias[i] if selected_gate_up_bias is not None else 0
         gate_down_bias = selected_down_bias[i] if selected_down_bias is not None else 0
-        gate_up_fn = torch.matmul if self.is_transposed else lambda x, y: torch.matmul(x, y.transpose(0, 1))
-        down_fn = torch.matmul if self.is_transposed else lambda x, y: torch.matmul(x, y.transpose(0, 1))
         tokens_for_this_expert = selected_hidden_states_g[start_idx:end_idx]
         expert_out = self._apply_gate(
             gate_up_fn(tokens_for_this_expert, gate_up) + gate_up_bias
@@ -110,13 +110,10 @@ def eager_mm_experts_forward(
     final_out = (
         outs.view(*top_k_index.shape, -1)
         .type(top_k_weights.dtype)
-        # .mul_(top_k_weights.unsqueeze(dim=-1))
         .sum(dim=1)
         .type(outs.dtype)
     )
     return final_out
-
-        
 
 
 def grouped_mm_experts_forward(
@@ -125,9 +122,9 @@ def grouped_mm_experts_forward(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    if not hasattr(torch, "_grouped_mm"):
+    if not hasattr(F, "grouped_mm"):
         raise ImportError(
-            "torch._grouped_mm is not available. Please make sure you are using a PyTorch version that includes it (2.9+)."
+            "F.grouped_mm is not available. Please make sure you are using a PyTorch version that includes it (2.9+)."
         )
 
     device = hidden_states.device
