@@ -116,12 +116,86 @@ def eager_mm_experts_forward(
     return final_out
 
 
+def grouped_mm_experts_forward_fast(
+    self: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    if not hasattr(F, "grouped_mm"):
+        raise ImportError(
+            "F.grouped_mm is not available. Please make sure you are using a PyTorch version that includes it (2.9+)."
+        )
+
+    device = hidden_states.device
+    num_top_k = top_k_index.size(-1)
+    num_tokens = hidden_states.size(0)
+    hidden_dim = hidden_states.size(-1)
+
+    # Reshape for easier indexing
+    # S is the number of selected tokens-experts pairs (S = num_tokens * num_top_k)
+    token_idx = torch.arange(num_tokens, device=device).repeat_interleave(num_top_k)
+    sample_weights = top_k_weights.reshape(-1)  # (S,)
+    expert_ids = top_k_index.reshape(-1)  # (S,)
+
+    # Get current hidden states for selected samples
+    selected_hidden_states = hidden_states[token_idx]
+
+    # Sort by expert for grouped processing
+    perm = torch.argsort(expert_ids)
+    expert_ids_g = expert_ids[perm]
+    sample_weights_g = sample_weights[perm]
+    token_idx_g = token_idx[perm]
+
+    selected_hidden_states_g = hidden_states.index_select(0, token_idx_g)
+
+    # Select expert weights and biases for selected samples
+    # NOTE: We keep all experts here and rely on offsets to target the active ones.
+    # I have already implemented a version that only passes the active experts, but
+    # to do so I had to use torch.unique which breaks the graph capture (data-dependent).
+    # Also there were no speedup gains from it in my experiments, even in eager mode.
+    selected_gate_up = self.gate_up_proj
+    selected_down = self.down_proj
+    selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_g] if self.has_bias else None
+    selected_down_bias = self.down_proj_bias[expert_ids_g] if self.has_bias else None
+
+    # Compute offsets for grouped_mm
+    # using histc instead of bincount to avoid cuda graph issues
+    # With deterministic algorithms, CPU only supports float input, CUDA only supports int input.
+    histc_input = expert_ids_g.float() if device.type == "cpu" else expert_ids_g.int()
+    num_tokens_per_expert = torch.histc(histc_input, bins=self.num_experts, min=0, max=self.num_experts - 1)
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+
+    # --- Up projection per expert (grouped) ---
+    gate_up_out = _grouped_linear(
+        selected_hidden_states_g, selected_gate_up, selected_gate_up_bias, offsets, is_transposed=self.is_transposed
+    )  # (S, 2 * intermediate_dim)
+
+    # Apply gating
+    gated_out = self._apply_gate(gate_up_out)  # (S, intermediate_dim)
+
+    # --- Down projection per expert (grouped) ---
+    out_per_sample_g = _grouped_linear(
+        gated_out, selected_down, selected_down_bias, offsets, is_transposed=self.is_transposed
+    )  # (S, hidden_dim)
+    # Apply routing weights
+    out_per_sample_g.mul_(sample_weights_g.unsqueeze(-1))
+    # Restore original order
+    final = torch.zeros(num_tokens, hidden_dim, device=out_per_sample_g.device, dtype=out_per_sample_g.dtype)
+    final.index_add_(0, token_idx_g, out_per_sample_g) # Source of non-deterministic
+    return final.to(hidden_states.dtype)
+
+
 def grouped_mm_experts_forward(
     self: torch.nn.Module,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
+    """
+    A faster grouped mm based implementation,
+    risking non-determinism due to use of atomicAdd in the accumulation step.
+    """
     if not hasattr(F, "grouped_mm"):
         raise ImportError(
             "F.grouped_mm is not available. Please make sure you are using a PyTorch version that includes it (2.9+)."
