@@ -182,8 +182,9 @@ def grouped_mm_experts_forward_fast(
     out_per_sample_g = _grouped_linear(
         gated_out, selected_down, selected_down_bias, offsets, is_transposed=self.is_transposed
     )  # (S, hidden_dim)
-    # Apply routing weights
-    out_per_sample_g.mul_(sample_weights_g.unsqueeze(-1))
+    # Apply routing weights, avoid in-place ops to prevent type promotion issues
+    # as sample_weights_g could be fp32 while out_per_sample_g is bf16/fp16
+    out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
     # Restore original order
     final = torch.zeros(num_tokens, hidden_dim, device=out_per_sample_g.device, dtype=out_per_sample_g.dtype)
     final.index_add_(0, token_idx_g, out_per_sample_g) # Source of non-deterministic
