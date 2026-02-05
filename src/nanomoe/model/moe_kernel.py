@@ -122,6 +122,10 @@ def grouped_mm_experts_forward_fast(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
+    """
+    A faster grouped mm based implementation,
+    risking non-determinism due to use of atomicAdd in the accumulation step.
+    """
     if not hasattr(F, "grouped_mm"):
         raise ImportError(
             "F.grouped_mm is not available. Please make sure you are using a PyTorch version that includes it (2.9+)."
@@ -192,10 +196,6 @@ def grouped_mm_experts_forward(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    A faster grouped mm based implementation,
-    risking non-determinism due to use of atomicAdd in the accumulation step.
-    """
     if not hasattr(F, "grouped_mm"):
         raise ImportError(
             "F.grouped_mm is not available. Please make sure you are using a PyTorch version that includes it (2.9+)."
